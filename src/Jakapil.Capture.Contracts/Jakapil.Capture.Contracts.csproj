@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <IsPackable>true</IsPackable>
+    <PackageId>Jakapil.Capture.Contracts</PackageId>
+    <Description>DTOs for the Jakapil Capture ingest wire contract.</Description>
+    <PackageTags>jakapil;capture;contracts;dto;api-testing</PackageTags>
+  </PropertyGroup>
+
+</Project>

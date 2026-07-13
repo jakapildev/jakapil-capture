@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <IsPackable>true</IsPackable>
+    <PackageId>Jakapil.Capture</PackageId>
+    <Description>ASP.NET Core middleware SDK that captures HTTP traffic from running .NET APIs.</Description>
+    <PackageTags>jakapil;capture;aspnetcore;middleware;http;api-testing</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Jakapil.Capture.Contracts\Jakapil.Capture.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Jakapil.Capture.Tests" />
+  </ItemGroup>
+
+</Project>
