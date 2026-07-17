@@ -24,7 +24,7 @@ internal sealed class CaptureExporter
     internal const string HttpClientName = "jakapil-capture-export";
 
     /// <summary>The SDK version sent in the <c>X-Jakapil-SDK</c> header.</summary>
-    internal const string SdkVersion = "1.0.1";
+    internal const string SdkVersion = "1.1.0";
 
     private static readonly JsonSerializerOptions WireJson = new(JsonSerializerDefaults.Web);
 

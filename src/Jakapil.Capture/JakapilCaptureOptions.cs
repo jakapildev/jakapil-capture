@@ -1,3 +1,5 @@
+using System.Net;
+using Jakapil.Capture.Anonymization;
 using Microsoft.Extensions.Options;
 
 namespace Jakapil.Capture;
@@ -47,13 +49,45 @@ public sealed class JakapilCaptureOptions
     public int QueueCapacity { get; set; } = 1024;
 
     /// <summary>Header names masked before capture (the value is replaced with <c>••••••••+last4</c>) — never sent to the collector in the clear.</summary>
+    /// <remarks>This is Tier-1 masking and is ALWAYS applied regardless of <see cref="HeaderCaptureAllowlist"/>
+    /// or <see cref="AnonymizedHeaderNames"/> (Phase 15c) — those are separate, additive controls; see their
+    /// own remarks for how the three header pipelines relate.</remarks>
     public string[] SensitiveHeaderNames { get; set; } =
     [
         "Authorization", "Cookie", "Set-Cookie", "Proxy-Authorization", "X-Api-Key",
     ];
 
+    /// <summary>
+    /// Phase 15c (ADR-0002 §10) opt-in allowlist: when set (even to an empty array), ONLY headers whose name
+    /// appears here are captured at all — every other header is omitted from the interaction entirely, never
+    /// sent to the collector. When left <c>null</c> (the default), today's behavior is unchanged: every header
+    /// is captured, with <see cref="SensitiveHeaderNames"/> masking applied to the sensitive ones.
+    /// </summary>
+    /// <remarks>
+    /// The ADR's stated model for headers is allowlist-first ("only forward what you explicitly decided
+    /// matters"), which is a stricter default than today's "capture everything except mask known-sensitive
+    /// names". Flipping the DEFAULT to allowlist mode would be a behavior change that could silently drop
+    /// headers a host currently relies on seeing in Jakapil — that is a product decision, not an engineering
+    /// one, so this ships as an opt-in with the existing behavior preserved by default. See the phase report
+    /// for the explicit question this raises.
+    /// </remarks>
+    public string[]? HeaderCaptureAllowlist { get; set; }
+
+    /// <summary>
+    /// Phase 15c (ADR-0002 §9) Tier-2: header NAMES whose VALUE is additionally run through field
+    /// classification/fingerprinting by <see cref="Anonymization.Anonymizer"/> before egress (distinct from
+    /// the Tier-1 masking above). Most headers are transport metadata, not business flow identifiers, so this
+    /// is opt-in and empty by default — set it only for headers a host knows carry a correlatable business id
+    /// (e.g. a custom idempotency-key header).
+    /// </summary>
+    public string[] AnonymizedHeaderNames { get; set; } = [];
+
     /// <summary>Header names treated as a custom correlation signal (see <c>CorrelationSignals.CustomCorrelationHeader</c>).</summary>
     public string[] CorrelationHeaderNames { get; set; } = ["X-Correlation-ID", "traceparent"];
+
+    /// <summary>Phase 15c (ADR-0002): field anonymization configuration — key/version/scope/policy. See
+    /// <see cref="Anonymization.AnonymizationOptions"/>.</summary>
+    public AnonymizationOptions Anonymization { get; set; } = new();
 
     /// <summary>The root address of the collector to which captured interactions are sent (e.g. <c>http://localhost:5238</c>).
     /// If left empty, the export worker stays idle; the queue exists only with its bounded capacity (DropOldest).</summary>
@@ -120,6 +154,15 @@ internal sealed class JakapilCaptureOptionsValidator : IValidateOptions<JakapilC
             {
                 failures.Add("When capture is enabled (Enabled=true), the collector address (CollectorUri) must be a valid, absolute URI.");
             }
+            else if (Uri.TryCreate(options.CollectorUri, UriKind.Absolute, out var collectorUri)
+                     && string.Equals(collectorUri.Scheme, "http", StringComparison.OrdinalIgnoreCase)
+                     && !IsLoopbackHost(collectorUri.Host))
+            {
+                // Phase 15c-10: a plaintext (non-TLS) collector address is only acceptable for local
+                // development against loopback; anywhere else it would ship captured traffic — anonymized or
+                // not — over an unencrypted channel.
+                failures.Add("The collector address (CollectorUri) uses http:// but its host is not localhost/loopback; use https:// outside local development.");
+            }
 
             if (string.IsNullOrWhiteSpace(options.IngestKey))
             {
@@ -127,8 +170,25 @@ internal sealed class JakapilCaptureOptionsValidator : IValidateOptions<JakapilC
             }
         }
 
+        if (options.Anonymization.KeyVersion < 0)
+        {
+            failures.Add("The anonymization key version (Anonymization.KeyVersion) must be non-negative.");
+        }
+
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)
             : ValidateOptionsResult.Success;
+    }
+
+    /// <summary>Reports whether a URI host is localhost or a loopback IP address (the only hosts a plaintext
+    /// <c>http://</c> collector address is accepted for — Phase 15c-10).</summary>
+    private static bool IsLoopbackHost(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address);
     }
 }

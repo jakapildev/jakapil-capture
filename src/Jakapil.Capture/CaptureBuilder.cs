@@ -109,7 +109,7 @@ public static class CaptureBuilder
             Method = request.Method,
             RawPath = reExecutedOriginalPath ?? request.Path.Value ?? string.Empty,
             QueryString = request.QueryString.HasValue ? request.QueryString.Value : null,
-            Headers = HeaderMasking.MaskHeaders(request.Headers, options.SensitiveHeaderNames),
+            Headers = HeaderMasking.MaskHeaders(request.Headers, options.SensitiveHeaderNames, options.HeaderCaptureAllowlist),
             RouteParameters = reExecutedOriginalPath is not null ? [] : RouteSchemaExtractor.ExtractRouteParameters(request, endpoint),
             QueryParameters = queryParameters,
             Body = body,
@@ -126,7 +126,7 @@ public static class CaptureBuilder
         return new CapturedResponse
         {
             StatusCode = response.StatusCode,
-            Headers = HeaderMasking.MaskHeaders(response.Headers, options.SensitiveHeaderNames),
+            Headers = HeaderMasking.MaskHeaders(response.Headers, options.SensitiveHeaderNames, options.HeaderCaptureAllowlist),
             Body = body,
             ContentType = response.ContentType,
             LocationHeader = response.Headers.Location.Count > 0 ? response.Headers.Location.ToString() : null,

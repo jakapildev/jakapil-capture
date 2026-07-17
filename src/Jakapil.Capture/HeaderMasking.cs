@@ -18,11 +18,25 @@ internal static class HeaderMasking
 
     /// <summary>Projects an <see cref="IHeaderDictionary"/> into a plain string mapping; masks the value of
     /// every header whose name matches <paramref name="sensitiveNames"/> (case-insensitive).</summary>
-    public static IReadOnlyDictionary<string, string> MaskHeaders(IHeaderDictionary headers, string[] sensitiveNames)
+    /// <param name="headers">The source ASP.NET Core header collection.</param>
+    /// <param name="sensitiveNames">Header names whose value is masked (Tier-1, ALWAYS applied).</param>
+    /// <param name="captureAllowlist">
+    /// Phase 15c (ADR-0002 §10) opt-in: when non-null (even empty), only header names appearing here are
+    /// included in the result at all — every other header is omitted entirely. <c>null</c> (the default)
+    /// preserves today's behavior of capturing every header.
+    /// </param>
+    public static IReadOnlyDictionary<string, string> MaskHeaders(
+        IHeaderDictionary headers, string[] sensitiveNames, string[]? captureAllowlist = null)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (key, value) in headers)
         {
+            if (captureAllowlist is not null
+                && !Array.Exists(captureAllowlist, n => string.Equals(n, key, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
             var isSensitive = Array.Exists(sensitiveNames, n => string.Equals(n, key, StringComparison.OrdinalIgnoreCase));
             result[key] = isSensitive ? MaskValue(value.ToString()) : value.ToString();
         }

@@ -1,3 +1,4 @@
+using Jakapil.Capture.Anonymization;
 using Jakapil.Capture.Contracts;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http;
@@ -13,6 +14,16 @@ namespace Jakapil.Capture;
 ///     any error degrades to "this interaction was not captured" instead of propagating.
 ///  2. The response the client receives is byte-for-byte identical to what the application produced — capture reads
 ///     a copy and never rewrites what goes over the wire.
+/// <para>
+/// <b>Anonymization seam (Phase 15c, ADR-0002):</b> after <see cref="CaptureBuilder.Build"/> assembles the wire
+/// DTO and before it is enqueued, <see cref="_anonymizer"/> runs the ENTIRE interaction through one transform
+/// (<c>IAnonymizer.Anonymize</c>). This single seam — rather than something inside <c>BodyCapture</c> or
+/// <c>CaptureBuilder</c> itself — was chosen because it operates on the already-fully-built, structure-typed
+/// DTO (body/route/query/headers all in their final shape), so it needs no knowledge of ASP.NET Core's request
+/// pipeline at all; it is a pure DTO→DTO function, easy to unit test in isolation (see
+/// <c>Jakapil.Capture.Tests.Anonymization</c>) and easy to reason about as "the one place plaintext could leak
+/// past". When no anonymization key is configured, the transform is a no-op (pass-through, today's behavior).
+/// </para>
 /// </remarks>
 public sealed class JakapilCaptureMiddleware
 {
@@ -21,16 +32,18 @@ public sealed class JakapilCaptureMiddleware
     private readonly ICapturedInteractionQueue _queue;
     private readonly IAuthTokenRegistry _authTokens;
     private readonly ICaptureRuntimeState _runtimeState;
+    private readonly IAnonymizer _anonymizer;
     private readonly ILogger<JakapilCaptureMiddleware> _logger;
 
     /// <summary>Constructs the middleware from the next pipeline component, options, the capture queue, the token
-    /// registry, remote runtime state, and the logger.</summary>
+    /// registry, remote runtime state, the anonymizer, and the logger.</summary>
     public JakapilCaptureMiddleware(
         RequestDelegate next,
         IOptions<JakapilCaptureOptions> options,
         ICapturedInteractionQueue queue,
         IAuthTokenRegistry authTokens,
         ICaptureRuntimeState runtimeState,
+        IAnonymizer anonymizer,
         ILogger<JakapilCaptureMiddleware> logger)
     {
         _next = next;
@@ -38,6 +51,7 @@ public sealed class JakapilCaptureMiddleware
         _queue = queue;
         _authTokens = authTokens;
         _runtimeState = runtimeState;
+        _anonymizer = anonymizer;
         _logger = logger;
     }
 
@@ -220,6 +234,7 @@ public sealed class JakapilCaptureMiddleware
             var responseBody = BuildResponseBody(context, captureStream);
 
             var interaction = CaptureBuilder.Build(context, requestStart, durationMs, requestBody, responseBody, thrown, _options, _authTokens);
+            interaction = _anonymizer.Anonymize(interaction);
 
             if (!await TryEnqueueAsync(interaction))
             {

@@ -17,7 +17,7 @@ public sealed class JakapilCaptureOptionsValidatorTests
     {
         var options = new JakapilCaptureOptions
         {
-            CollectorUri = "http://collector.test",
+            CollectorUri = "https://collector.test",
             IngestKey = "ik_test",
         };
 
@@ -49,7 +49,7 @@ public sealed class JakapilCaptureOptionsValidatorTests
         var options = new JakapilCaptureOptions
         {
             Enabled = true,
-            CollectorUri = "http://collector.test",
+            CollectorUri = "https://collector.test",
             IngestKey = null,
         };
 

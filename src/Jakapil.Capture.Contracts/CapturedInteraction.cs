@@ -56,6 +56,11 @@ public sealed record CapturedInteraction
     /// login/register response produced its token. The raw token is never captured.</summary>
     public AuthBinding? Auth { get; init; }
 
+    /// <summary>Anonymization scheme metadata (ADR-0002, Phase 15b-1/15c) this interaction was produced under;
+    /// null means a legacy SDK captured this interaction WITHOUT anonymizing it (plaintext) — see
+    /// <see cref="AnonymizationInfo"/>.</summary>
+    public AnonymizationInfo? Anon { get; init; }
+
     /// <summary>Carries fields this contract does not currently recognize (new/experimental) — for forward-compatibility observation, never mapped to Core.</summary>
     /// <remarks>
     /// Unknown fields sent by a newer-versioned SDK accumulate here; the server logs only the field

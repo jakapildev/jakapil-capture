@@ -1,3 +1,4 @@
+using Jakapil.Capture.Anonymization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -28,6 +29,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ICapturedInteractionQueue>(sp => sp.GetRequiredService<CapturedInteractionQueue>());
 
         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
+
+        services.AddSingleton<IAnonymizer, Anonymizer>();
 
         services.AddHttpClient(CaptureExporter.HttpClientName);
         services.AddSingleton<CaptureExporter>();

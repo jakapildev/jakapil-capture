@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Jakapil.Capture;
+using Jakapil.Capture.Anonymization;
 using Jakapil.Capture.Contracts;
 
 namespace Jakapil.Capture.Tests;
@@ -36,6 +37,12 @@ public class JakapilCaptureMiddlewareTests
 
         public void Clear() => Captured.Clear();
     }
+
+    /// <summary>Builds an <see cref="IAnonymizer"/> with no key configured (deterministic pass-through) via the
+    /// internal test seam, so these pipeline-focused tests are independent of the real process environment
+    /// (never depends on whether <c>JAKAPIL_ANON_KEY</c> happens to be set on the machine running the tests).
+    /// Anonymization's own behavior is covered separately in <c>Anonymization/AnonymizerTests.cs</c>.</summary>
+    private static IAnonymizer PassThroughAnonymizer() => new Anonymizer(key: null, new AnonymizationOptions(), []);
 
     /// <summary>Waits for the capture on the exception path (deferred, finalized inside OnCompleted) to arrive, then
     /// verifies there is exactly one interaction. Normal-path captures are synchronous and never need this.</summary>
@@ -67,6 +74,7 @@ public class JakapilCaptureMiddlewareTests
                         services.Configure<JakapilCaptureOptions>(o => configure?.Invoke(o));
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
+                        services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
                         services.AddSingleton(runtimeState ?? new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();
@@ -340,6 +348,7 @@ public class JakapilCaptureMiddlewareTests
                         services.Configure<JakapilCaptureOptions>(_ => { });
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
+                        services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
                         services.AddSingleton<ICaptureRuntimeState>(new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();
@@ -429,6 +438,7 @@ public class JakapilCaptureMiddlewareTests
                         services.Configure<JakapilCaptureOptions>(_ => { });
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
+                        services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
                         services.AddSingleton<ICaptureRuntimeState>(new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();
