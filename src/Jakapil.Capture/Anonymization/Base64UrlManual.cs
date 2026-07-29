@@ -23,4 +23,23 @@ internal static class Base64UrlManual
         var base64 = Convert.ToBase64String(bytes);
         return base64.Replace('+', '-').Replace('/', '_').TrimEnd('=');
     }
+
+    /// <summary>Decodes an unpadded base64url string (RFC 4648 §5) back to bytes: <c>-</c>→<c>+</c>,
+    /// <c>_</c>→<c>/</c>, padding restored from the string length, then standard base64 decode. Used by
+    /// ADR-0003's replay-signature verification (<c>sig</c>, <c>n</c> header fields) — added alongside
+    /// <see cref="Encode"/> for the same "one hand-written implementation on every target framework" reason.</summary>
+    /// <exception cref="FormatException">The input is not valid base64url (wrong length/alphabet).</exception>
+    public static byte[] Decode(string base64Url)
+    {
+        var base64 = base64Url.Replace('-', '+').Replace('_', '/');
+        base64 += (base64.Length % 4) switch
+        {
+            0 => string.Empty,
+            2 => "==",
+            3 => "=",
+            _ => throw new FormatException("Invalid base64url string length."),
+        };
+
+        return Convert.FromBase64String(base64);
+    }
 }

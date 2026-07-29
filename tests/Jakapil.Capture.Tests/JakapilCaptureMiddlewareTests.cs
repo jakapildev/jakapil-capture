@@ -7,10 +7,13 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Jakapil.Capture;
 using Jakapil.Capture.Anonymization;
 using Jakapil.Capture.Contracts;
+using Jakapil.Capture.Replay;
 
 namespace Jakapil.Capture.Tests;
 
@@ -44,6 +47,22 @@ public class JakapilCaptureMiddlewareTests
     /// Anonymization's own behavior is covered separately in <c>Anonymization/AnonymizerTests.cs</c>.</summary>
     private static IAnonymizer PassThroughAnonymizer() => new Anonymizer(key: null, new AnonymizationOptions(), []);
 
+    /// <summary>
+    /// Registers the real ADR-0003 replay-verification stack (key ring, nonce cache, verifier) with no
+    /// configured public keys — the exact same "feature not configured" shape a host that never sets
+    /// <c>JakapilCaptureOptions.Replay.PublicKeys</c> gets. <see cref="JakapilCaptureMiddleware"/> now requires
+    /// <see cref="IReplayVerifier"/> to be resolvable, so every test server needs this registered even when a
+    /// given test has nothing to do with replay signatures; using the REAL implementation (rather than a fake)
+    /// keeps these pipeline-focused tests honest about "no header configured" really behaving like today.
+    /// </summary>
+    private static void AddNoOpReplayVerification(IServiceCollection services)
+    {
+        services.AddSingleton<IReplayKeyRing, ReplayKeyRing>();
+        services.AddSingleton(sp => new ReplayNonceCache(sp.GetRequiredService<IOptions<JakapilCaptureOptions>>().Value.Replay.NonceCacheSize));
+        services.AddSingleton<IReplayVerifier, ReplayVerifier>();
+        services.TryAddSingleton(TimeProvider.System);
+    }
+
     /// <summary>Waits for the capture on the exception path (deferred, finalized inside OnCompleted) to arrive, then
     /// verifies there is exactly one interaction. Normal-path captures are synchronous and never need this.</summary>
     private static async Task<CapturedInteraction> WaitForSingleCaptureAsync(RecordingQueue queue, int timeoutMs = 5000)
@@ -75,6 +94,7 @@ public class JakapilCaptureMiddlewareTests
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
                         services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
+                        AddNoOpReplayVerification(services);
                         services.AddSingleton(runtimeState ?? new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();
@@ -349,6 +369,7 @@ public class JakapilCaptureMiddlewareTests
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
                         services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
+                        AddNoOpReplayVerification(services);
                         services.AddSingleton<ICaptureRuntimeState>(new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();
@@ -439,6 +460,7 @@ public class JakapilCaptureMiddlewareTests
                         services.AddSingleton<ICapturedInteractionQueue>(queue);
                         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
                         services.AddSingleton<IAnonymizer>(PassThroughAnonymizer());
+                        AddNoOpReplayVerification(services);
                         services.AddSingleton<ICaptureRuntimeState>(new CaptureRuntimeState());
                         services.AddRouting();
                         services.AddLogging();

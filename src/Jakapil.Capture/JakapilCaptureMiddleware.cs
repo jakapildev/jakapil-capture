@@ -1,5 +1,6 @@
 using Jakapil.Capture.Anonymization;
 using Jakapil.Capture.Contracts;
+using Jakapil.Capture.Replay;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -24,6 +25,17 @@ namespace Jakapil.Capture;
 /// <c>Jakapil.Capture.Tests.Anonymization</c>) and easy to reason about as "the one place plaintext could leak
 /// past". When no anonymization key is configured, the transform is a no-op (pass-through, today's behavior).
 /// </para>
+/// <para>
+/// <b>Signed-replay seam (Phase 15d-15, ADR-0003):</b> before any capture decision is made,
+/// <see cref="_replayVerifier"/> checks whether the request carries a valid <c>X-Jakapil-Replay</c> signature
+/// from the Jakapil Runner. A request with no such header (ordinary traffic — the overwhelming majority) pays
+/// no cost at all and falls straight through to the existing capture logic, unchanged. A request with a VALID
+/// signature takes a completely separate path (<see cref="InvokeReplayAsync"/>): capture is skipped
+/// unconditionally, and the response is buffered in full and masked on the way out (same key/Scope/
+/// classification as capture, ADR-0003 §5) before it ever reaches the caller. A request with an INVALID or
+/// malformed signature is treated EXACTLY like one with no header at all (INV-B3 — the signature is a
+/// behavior switch, never an authorization gate, and doubt always resolves to "no special behavior").
+/// </para>
 /// </remarks>
 public sealed class JakapilCaptureMiddleware
 {
@@ -33,10 +45,11 @@ public sealed class JakapilCaptureMiddleware
     private readonly IAuthTokenRegistry _authTokens;
     private readonly ICaptureRuntimeState _runtimeState;
     private readonly IAnonymizer _anonymizer;
+    private readonly IReplayVerifier _replayVerifier;
     private readonly ILogger<JakapilCaptureMiddleware> _logger;
 
     /// <summary>Constructs the middleware from the next pipeline component, options, the capture queue, the token
-    /// registry, remote runtime state, the anonymizer, and the logger.</summary>
+    /// registry, remote runtime state, the anonymizer, the replay-signature verifier, and the logger.</summary>
     public JakapilCaptureMiddleware(
         RequestDelegate next,
         IOptions<JakapilCaptureOptions> options,
@@ -44,6 +57,7 @@ public sealed class JakapilCaptureMiddleware
         IAuthTokenRegistry authTokens,
         ICaptureRuntimeState runtimeState,
         IAnonymizer anonymizer,
+        IReplayVerifier replayVerifier,
         ILogger<JakapilCaptureMiddleware> logger)
     {
         _next = next;
@@ -52,14 +66,26 @@ public sealed class JakapilCaptureMiddleware
         _authTokens = authTokens;
         _runtimeState = runtimeState;
         _anonymizer = anonymizer;
+        _replayVerifier = replayVerifier;
         _logger = logger;
     }
 
-    /// <summary>Entry point for every request: if capture is not enabled (either locally disabled OR remotely
-    /// turned off from the server) or sampling excluded this request, it passes the pipeline straight through;
-    /// otherwise it executes the request with capture.</summary>
+    /// <summary>
+    /// Entry point for every request. First checks for a valid signed-replay header (ADR-0003) — a request
+    /// carrying one takes the dedicated <see cref="InvokeReplayAsync"/> path (capture suppressed, response
+    /// masked) regardless of <see cref="JakapilCaptureOptions.Enabled"/>/sampling, since replay behavior is
+    /// keyed off the signature, not the ambient capture on/off switch. Otherwise, if capture is not enabled
+    /// (either locally disabled OR remotely turned off from the server) or sampling excluded this request, it
+    /// passes the pipeline straight through; otherwise it executes the request with capture.
+    /// </summary>
     public async Task InvokeAsync(HttpContext context)
     {
+        if (await _replayVerifier.VerifyAsync(context))
+        {
+            await InvokeReplayAsync(context);
+            return;
+        }
+
         if (!IsEffectivelyEnabled() || !ShouldSample(context))
         {
             await _next(context);
@@ -67,6 +93,293 @@ public sealed class JakapilCaptureMiddleware
         }
 
         await InvokeCaptureAsync(context);
+    }
+
+    /// <summary>
+    /// Executes a request whose <c>X-Jakapil-Replay</c> signature has already verified (ADR-0003): the
+    /// response is fully buffered (via <see cref="ReplayMaskingResponseStream"/>, never teed to the wire
+    /// unbuffered like ordinary capture) so it can be masked before any byte reaches the caller. This request
+    /// is NEVER captured/enqueued — capture suppression for signed replay traffic is unconditional
+    /// (ADR-0003 §6.6, PLAN 15d-15-5), independent of sampling or the <see cref="JakapilCaptureOptions.Enabled"/>
+    /// switch.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="InvokeCaptureAsync"/>'s exception-deferral shape (see that method's remarks): if an
+    /// OUTER exception-handling middleware registered BEFORE <c>UseJakapilCapture()</c> translates the
+    /// exception into the real response, that write must still be visible to the masking stream, so
+    /// finalization is deferred to <see cref="HttpResponse.OnCompleted"/> on the exception path exactly like
+    /// the capture path defers there. Unlike capture, there is no need for the re-executed-status-code-pages
+    /// path snapshot — masking only cares about the FINAL response bytes, never the route template.
+    /// </remarks>
+    private async Task InvokeReplayAsync(HttpContext context)
+    {
+        var originalResponseBody = context.Response.Body;
+        var maskingStream = new ReplayMaskingResponseStream(_options.Replay.MaxMaskedResponseBytes);
+        context.Response.Body = maskingStream;
+
+        var deferredToCompletion = false;
+        try
+        {
+            await _next(context);
+        }
+        catch
+        {
+            deferredToCompletion = TryDeferReplayFinalizeToCompletion(context, maskingStream, originalResponseBody);
+            throw;
+        }
+        finally
+        {
+            if (!deferredToCompletion)
+            {
+                context.Response.Body = originalResponseBody;
+                await FinalizeReplayResponseAsync(context, maskingStream, originalResponseBody);
+                await maskingStream.DisposeAsync();
+            }
+        }
+    }
+
+    /// <summary>Registers an <see cref="HttpResponse.OnCompleted"/> callback that finalizes the replay
+    /// masking once the response is fully produced — the only moment an outer exception-handler middleware's
+    /// real status + error body is visible. Mirrors <see cref="TryDeferFinalizeToCompletion"/>; see that
+    /// method's remarks for why this pattern is needed at all.</summary>
+    private bool TryDeferReplayFinalizeToCompletion(HttpContext context, ReplayMaskingResponseStream maskingStream, Stream originalResponseBody)
+    {
+        try
+        {
+            context.Response.OnCompleted(async () =>
+            {
+                try
+                {
+                    context.Response.Body = originalResponseBody;
+                    await FinalizeReplayResponseAsync(context, maskingStream, originalResponseBody);
+                }
+                finally
+                {
+                    await maskingStream.DisposeAsync();
+                }
+            });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Jakapil: could not defer exception-path replay masking to OnCompleted; response will be sent unmasked");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Decides whether the buffered replay response can be masked, writes the (masked or, if unmaskable,
+    /// original) bytes to the real response stream, and — only when masking actually ran — sets the
+    /// masking-confirmation header the Jakapil cloud side requires before persisting anything (ADR-0003
+    /// INV-B1). Never throws: any failure here falls back to forwarding the buffered bytes as-is, because the
+    /// alternative (giving the caller nothing) would be a worse failure than an unmasked or malformed response.
+    /// </summary>
+    private async Task FinalizeReplayResponseAsync(HttpContext context, ReplayMaskingResponseStream maskingStream, Stream originalResponseBody)
+    {
+        try
+        {
+            var buffered = maskingStream.BufferedBytes;
+            var outputBytes = buffered;
+            var maskingApplied = false;
+            IReadOnlyList<string>? liveJsonPaths = null;
+
+            if (maskingStream.Truncated)
+            {
+                _logger.LogDebug(
+                    "Jakapil: replay response ({TotalBytes} bytes) exceeded Replay.MaxMaskedResponseBytes; sending the buffered prefix through UNMASKED and without the masking-confirmation header",
+                    maskingStream.TotalBytesWritten);
+            }
+            else if (_anonymizer.HasKey)
+            {
+                var masked = _anonymizer.MaskReplayResponseBody(buffered, context.Response.ContentType);
+                if (masked is not null)
+                {
+                    outputBytes = masked.Body;
+                    liveJsonPaths = masked.LiveJsonPaths;
+                    maskingApplied = true;
+                }
+            }
+            else
+            {
+                // ADR-0003 §8.4: no anonymization key configured (legacy pass-through mode) — capture
+                // suppression still applies (already unconditional, InvokeReplayAsync never captures), but
+                // there is no key to mask WITH, so the live body goes through unchanged. The confirmation
+                // header is still sent, with scheme=none, so the cloud side's INV-B1 guard can tell "verified
+                // signature, no masking possible" apart from "no SDK / signature never verified" — both leave
+                // the header off in every OTHER unmaskable case above/below, but this one is a deliberate,
+                // honestly-reported exception per the ADR.
+                SetMaskedHeader(context, scheme: "none");
+                await WriteReplayResponseAsync(context, originalResponseBody, buffered, setContentLength: false);
+                return;
+            }
+
+            // Headers (including the masking-confirmation header) MUST be set before the first byte reaches
+            // the real stream — writing starts the response, after which ASP.NET Core's HttpResponse.HasStarted
+            // makes further header mutation throw. WriteReplayResponseAsync is what performs that first write.
+            if (maskingApplied)
+            {
+                // v1.2.0 — RunCredential for response headers (ADR-0003 §5 revision, WHY #1): decide the
+                // Set-Cookie/Location disposition BEFORE the confirmation header, so their outcome can be
+                // folded into the SAME header's liveHeaders= declaration in one write.
+                var liveHeaderNames = ProcessRunCredentialResponseHeaders(context);
+                SetMaskedHeader(context, _anonymizer.Scheme, liveJsonPaths, liveHeaderNames);
+            }
+
+            var contentLengthChanged = outputBytes.Length != buffered.Length;
+            await WriteReplayResponseAsync(context, originalResponseBody, outputBytes, setContentLength: contentLengthChanged);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Jakapil: failed to finalize replay response masking; forwarding the buffered response unmodified");
+            try
+            {
+                await originalResponseBody.WriteAsync(maskingStream.BufferedBytes);
+                await originalResponseBody.FlushAsync();
+            }
+            catch (Exception writeEx)
+            {
+                _logger.LogDebug(writeEx, "Jakapil: failed to forward the buffered replay response after a masking error");
+            }
+        }
+    }
+
+    /// <summary>Writes the final response bytes to the real stream, correcting <c>Content-Length</c> first if
+    /// it was explicitly set and the byte count changed (masking can change body length) — done BEFORE the
+    /// first write, since nothing has touched the real stream yet at this point and the header is still
+    /// mutable. If the response has unexpectedly already started (an application called
+    /// <see cref="HttpResponse.StartAsync"/> itself, or similar), setting headers throws; that is swallowed so
+    /// the body write below still happens rather than losing the response entirely.</summary>
+    private static async Task WriteReplayResponseAsync(HttpContext context, Stream originalResponseBody, ReadOnlyMemory<byte> bytes, bool setContentLength)
+    {
+        if (setContentLength && !context.Response.HasStarted)
+        {
+            try
+            {
+                context.Response.ContentLength = bytes.Length;
+            }
+            catch (InvalidOperationException)
+            {
+                // Headers already sent somehow; fall through and write the body anyway.
+            }
+        }
+
+        await originalResponseBody.WriteAsync(bytes);
+        await originalResponseBody.FlushAsync();
+    }
+
+    /// <summary>
+    /// Sets the ADR-0003 masking-confirmation header. Swallows the (rare) case where headers have already
+    /// started, for the same reason as <see cref="WriteReplayResponseAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Grammar (v1.2.0 — authoritative; additive over the pre-v1.2.0 <c>v1;scheme=...;keyVersion=...</c>
+    /// format, which is still exactly its own prefix):</b></para>
+    /// <code>
+    /// X-Jakapil-Masked: v1;scheme=&lt;scheme&gt;;keyVersion=&lt;n&gt;[;live=&lt;path&gt;(,&lt;path&gt;)*][;liveHeaders=&lt;name&gt;(,&lt;name&gt;)*]
+    /// </code>
+    /// <list type="bullet">
+    /// <item><c>scheme</c>/<c>keyVersion</c>: unchanged from before v1.2.0.</item>
+    /// <item><c>live=</c> (OMITTED entirely when there are no RunCredential leaves — never an empty
+    /// <c>live=</c>): a comma-separated list of JSONPaths, root-relative (<c>$</c>), of every response-body leaf
+    /// that passed through LIVE via the v1.2.0 RunCredential mechanism (<see cref="IAnonymizer.MaskReplayResponseBody"/>'s
+    /// <c>ReplayBodyMaskingResult.LiveJsonPaths</c>) — <see cref="FieldClass.FlowFingerprint"/> passthrough
+    /// leaves (ADR-0003 §5's ORIGINAL decision, unchanged) are DELIBERATELY NOT included here: that mechanism
+    /// already worked before this header existed and needs no new signal; `live=` is scoped to exactly the NEW
+    /// passthrough category this version adds. Object property access is <c>.name</c>; an array is a SINGLE
+    /// <c>[*]</c> wildcard covering every element (not one entry per index — matches how this SDK already
+    /// classifies every array item under one shared field name, ADR-0002 §5). A property name that is not a
+    /// simple <c>[A-Za-z_][A-Za-z0-9_]*</c> identifier is percent-encoded (<see cref="Uri.EscapeDataString"/>,
+    /// plus an explicit <c>.</c> → <c>%2E</c> substitution for the one delimiter that function leaves unescaped)
+    /// — decode with the matching <see cref="Uri.UnescapeDataString"/>. Examples: a top-level
+    /// <c>{"token":"..."}</c> → <c>live=$.token</c>; <c>{"auth":{"sessionToken":"..."}}</c> →
+    /// <c>live=$.auth.sessionToken</c>; <c>{"items":[{"cursor":"..."}]}</c> → <c>live=$.items[*].cursor</c>;
+    /// multiple leaves are comma-joined: <c>live=$.token,$.items[*].cursor</c>.</item>
+    /// <item><c>liveHeaders=</c> (also omitted when empty): a comma-separated list of response HEADER NAMES
+    /// (never percent-encoded — an HTTP header name is already restricted to RFC 7230 token characters, which
+    /// cannot contain <c>,</c>/<c>;</c>) that passed through live — only ever <c>Set-Cookie</c> and/or
+    /// <c>Location</c>, the two headers <see cref="ProcessRunCredentialResponseHeaders"/> evaluates.</item>
+    /// </list>
+    /// <para><b>Parsing note for the Jakapil side:</b> split the whole value on <c>;</c> first; each resulting
+    /// token is either a bare flag or a <c>key=value</c> pair. For <c>live</c>/<c>liveHeaders</c>, split their
+    /// value on <c>,</c> (safe — no encoded segment can ever contain a literal comma, by construction above),
+    /// then for <c>live</c> entries, split each JSONPath on <c>.</c> and <c>[*]</c> and
+    /// <see cref="Uri.UnescapeDataString"/> each property segment.</para>
+    /// </remarks>
+    private void SetMaskedHeader(
+        HttpContext context, string scheme, IReadOnlyList<string>? liveJsonPaths = null, IReadOnlyList<string>? liveHeaderNames = null)
+    {
+        if (context.Response.HasStarted)
+        {
+            return;
+        }
+
+        try
+        {
+            var value = $"v1;scheme={scheme};keyVersion={_anonymizer.KeyVersion}";
+            if (liveJsonPaths is { Count: > 0 })
+            {
+                value += $";live={string.Join(',', liveJsonPaths)}";
+            }
+
+            if (liveHeaderNames is { Count: > 0 })
+            {
+                value += $";liveHeaders={string.Join(',', liveHeaderNames)}";
+            }
+
+            context.Response.Headers[ReplayProtocol.MaskedResponseHeaderName] = value;
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// v1.2.0 — RunCredential for response headers (ADR-0003 §5 revision, WHY #1): applies
+    /// <see cref="IAnonymizer.ClassifyReplayResponseHeader"/> to the two headers ever in scope for replay
+    /// masking — <c>Set-Cookie</c> (which ASP.NET Core may repeat as multiple header lines — each is classified
+    /// independently) and <c>Location</c> — replacing each present header's value(s) in place, and returns the
+    /// subset of those two names that passed through live for <see cref="SetMaskedHeader"/>'s <c>liveHeaders=</c>
+    /// declaration. A header that is absent from the response is skipped entirely (nothing to declare). Must run
+    /// BEFORE the first response byte is written — same <see cref="HttpResponse.HasStarted"/> constraint as
+    /// <see cref="SetMaskedHeader"/>, enforced the same way (swallow and skip rather than throw).
+    /// </summary>
+    private List<string> ProcessRunCredentialResponseHeaders(HttpContext context)
+    {
+        var liveHeaderNames = new List<string>();
+        ProcessRunCredentialResponseHeader(context, "Set-Cookie", liveHeaderNames);
+        ProcessRunCredentialResponseHeader(context, "Location", liveHeaderNames);
+        return liveHeaderNames;
+    }
+
+    private void ProcessRunCredentialResponseHeader(HttpContext context, string headerName, List<string> liveHeaderNames)
+    {
+        if (context.Response.HasStarted || !context.Response.Headers.TryGetValue(headerName, out var values) || values.Count == 0)
+        {
+            return;
+        }
+
+        var results = new string[values.Count];
+        var anyLive = false;
+        for (var i = 0; i < values.Count; i++)
+        {
+            var decision = _anonymizer.ClassifyReplayResponseHeader(headerName, values[i] ?? string.Empty);
+            results[i] = decision.Value;
+            anyLive |= decision.PassedLive;
+        }
+
+        try
+        {
+            context.Response.Headers[headerName] = results;
+        }
+        catch (InvalidOperationException)
+        {
+            return;
+        }
+
+        if (anyLive)
+        {
+            liveHeaderNames.Add(headerName);
+        }
     }
 
     /// <summary>Effective capture state: the local <see cref="JakapilCaptureOptions.Enabled"/> is a HARD FLOOR

@@ -60,6 +60,247 @@ Other settings (`MaxCapturedResponseBytes`, `StreamingContentTypes`, `QueueCapac
 `ExportFlushIntervalSeconds`) ship with sensible defaults; see the `JakapilCaptureOptions`
 XML documentation comments for details.
 
+## Field anonymization
+
+When `AnonymizationOptions` is configured with a key (`JAKAPIL_ANON_KEY` by default), every captured
+request/response leaf is classified and transformed before it leaves your process — no raw production
+value (name, email, password, flow identifier, ...) is ever sent to the collector. See
+`Jakapil.Capture.Anonymization.FieldClass` for the four possible outcomes (`SafeLiteral`,
+`FlowFingerprint`, `SyntheticPii`, `SecretTombstone`) and `AnonymizationOptions.FieldPolicy` for the
+customer override that always wins over the built-in rules below.
+
+### Generic `name` is context-sensitive (since v1.2.0)
+
+Strong-signal person-name fields (`fullName`, `firstName`, `lastName`, `surname`, ...) are **always**
+synthesized, in every context. The bare, generic field `name`, however, is ambiguous on its own — a
+`GET /api/catalog-types` response with `{ "catalogTypes": [ { "name": "Mug" }, { "name": "T-Shirt" } ] }`
+is not personal data, but earlier versions treated it exactly like `fullName` and rewrote every category
+label to a synthetic person name (e.g. `"Sage Blake"`). Scenarios built from that capture then asserted
+the wrong literal on every replay against the live API — a guaranteed, reproducible false regression, not
+a real product bug.
+
+As of v1.2.0, a bare `name` field is only classified as PII (`SyntheticPii`) when the JSON object that
+directly contains it has a field name that itself suggests a person or contact record — e.g.
+`$.customer.name`, `$.billingAddress.name`. With no enclosing object (a root-level `name`) or a
+non-person parent (`$.catalogTypes[].name`, `$.products[].name`), the value passes through unchanged as
+`SafeLiteral`. **Plural collection endpoints are recognized too** — `$.users[].name`,
+`$.customers[].name`, `$.employees[].name` all still resolve to `SyntheticPii` (a simple, deterministic
+singularization is tried against the person-context word list — no inflection library, no IO) — this
+matters because a plural collection is the single most common REST shape a person record appears in.
+
+**Privacy trade-off.** This intentionally loosens the default: false positives (real, non-personal labels
+rewritten as fake names) become rarer, but so does the safety margin — a field literally called `name`
+that *does* hold a person's name, under a parent object this heuristic does not recognize (an unusual or
+customer-specific schema), will now be sent as plaintext instead of being synthesized. The singularization
+step is deliberately biased toward over-matching, not under-matching: a made-up plural that happens to
+singularize into a listed word gets anonymized unnecessarily (recoverable via `FieldPolicy`), which is
+preferred over the alternative of missing a real one (unrecoverable — the value is already off your
+machine). If your API uses bare `name` for personal data in a context not covered by the built-in list
+(`user`, `customer`, `person`, `contact`, `member`, `employee`, `account`, `buyer`, `seller`, `recipient`,
+`sender`, `owner`, `author`, `patient`, `client`, `guest`, `subscriber`, `profile`, `billing`, `shipping`,
+`address` — singular or plural), set it explicitly via `FieldPolicy`:
+
+```csharp
+options.Anonymization.FieldPolicy["name"] = FieldClass.SyntheticPii;
+```
+
+`FieldPolicy` always takes priority over every built-in rule, including this one.
+
+### Type-preserving replacement values (since v1.2.0)
+
+Whatever a leaf's JSON type was, its replacement keeps that type — a JSON *number* is replaced by a
+synthetic *number* (never a quoted string), a JSON *boolean* is never replaced at all (booleans are
+never ambiguous), and a JSON *string* is replaced by a synthetic *string*. Classification is unaffected
+by this guarantee — an unrecognized field still fails safe to `SyntheticPii` exactly as documented above;
+only the **shape** of the replacement value changes to match what it is standing in for. Two concrete
+consequences:
+
+- A numeric field with no recognized name (e.g. `PageSize`/`PageIndex` query parameters) used to
+  synthesize to alphanumeric text (`synthetic-77598c5712fd`), which many APIs' model binders reject
+  outright (`400 Bad Request`) — breaking replay while still hiding nothing useful. It now synthesizes to
+  numeric text instead (still non-reversible and non-correlatable outside its key/scope), so the request
+  stays valid. Route, query, and header values are always *text on the wire* (there is no JSON container
+  type at those positions), so "type" there means the replacement must still *parse* as the original kind
+  — a numeric query parameter synthesizes to digits, a `true`/`false`-shaped one synthesizes to
+  `true`/`false`.
+- A JSON body number classified `SyntheticPii` (via an explicit `FieldPolicy` override — the built-in
+  fail-safe never routes a bare number there on its own) is written back as an unquoted JSON number, not a
+  quoted string, and stays integral when the original had no fractional part. The synthetic magnitude is
+  always bounded well within a 32-bit integer's range, regardless of how large the original value was.
+
+This does **not** change how `FlowFingerprint` (`fp:...`) and `SecretTombstone` (`jkp:tomb:...`)
+envelopes are written for a JSON body leaf — those remain textual by design, and the envelope grammar
+itself already records the original JSON type as an embedded tag (`fp:n:...`, `jkp:tomb:n:...`) for the
+server side to use. The one passthrough exception is described next.
+
+## Signed replay-request verification (since v1.2.0)
+
+When the Jakapil Runner re-runs a scenario against your API (a "koşum"), it can attach a cryptographically
+signed `X-Jakapil-Replay` header to each request. When this SDK verifies that signature, two things happen to
+that request that never happen for ordinary traffic:
+
+1. **It is never captured/exported.** Replay traffic would otherwise pollute your captured corpus with its own
+   test data, so a verified replay request is unconditionally excluded from capture — independent of
+   `SampleRate` or even `Enabled`.
+2. **The response body is masked on the way out**, using the exact same anonymization key, `Scope`, and field
+   classification as ordinary capture-side anonymization (see "Field anonymization" above) — so your API's
+   *live* production-shaped response ("Mug") comes back anonymized ("Sage Blake") exactly like the *captured*
+   corpus value it is being compared against, letting equality-style assertions built from anonymized capture
+   data pass against a live re-run without ever exposing what your API actually returned. One exception: fields
+   correlating one response to the next request in the same scenario (order id, created resource id, ...) are
+   left as their live value, because the Runner needs the *real* identifier your API produced to keep chaining
+   requests correctly — masking those would break the scenario, and they carry no personal content of their own.
+   This live value is written back with its **original JSON type intact** (since v1.2.0) — a numeric id stays
+   a JSON number, never a quoted string — so a scenario's schema assertion (`{ id: Number }`) still passes
+   against the masked replay response exactly as it would against the real one.
+
+### Run-issued credentials pass through live too (since v1.2.0)
+
+The same problem that justifies the FlowFingerprint exception above also applies to a login/session response: a
+`token` field used to come back as a `jkp:tomb:s:token` marker, which the Runner cannot inject into the next
+step's `Authorization` header — no authenticated scenario could ever be replayed. As of v1.2.0, a field whose
+name's semantic kind is **`token`, `session`, `cookie`, `csrf`, or `cursor`** — matched on the TRAILING
+camelCase/snake_case word, e.g. `token`, `authToken`, `sessionToken`, `csrfToken`, `nextCursor` all match
+(`sessionId` does not — its trailing word is `id`, already covered by the pre-existing FlowFingerprint
+passthrough) — also passes through **live**, for the identical reason FlowFingerprint does: the target produced
+it during this run, and the Runner needs the real value to keep the scenario going. This pre-empts whatever
+classification the field would otherwise have received — most commonly `SecretTombstone`, since `token`/`cookie`
+are also secret field names.
+
+Two response **headers** get the same treatment: `Set-Cookie` and `Location` — the two places a run-issued
+session identifier or a newly created resource's address are most likely to appear outside the body.
+
+**`password` never passes through, by construction** — it is not, and never will be, one of the five allowlisted
+words, so an echoed password field stays tombstoned exactly as before. A compound name like
+`passwordResetToken` *does* pass through (its trailing word is `token`) — that field holds a token the target
+issued during the run, not the password value itself, which is the correct call under the same rule.
+
+`FieldPolicy` is still the escape hatch and always wins: an explicit override for a field or header name (e.g.
+`options.Anonymization.FieldPolicy["token"] = FieldClass.SecretTombstone;`) is honored instead of the
+RunCredential default, for both JSON leaves and the two headers.
+
+### Idempotent replay masking (since v1.2.0)
+
+Masking a replay response used to be a one-way street: if the Jakapil Runner sent a synthetic value from its
+corpus (say, a synthesized name) and your API validated and echoed it straight back, this SDK — seeing that
+echoed text as if it were fresh production data — synthesized it *again*, seeded off the synthetic text itself
+rather than the original raw value, producing a **second, different** synthetic value. Every echo-equality
+assertion built from the corpus then failed structurally, even though your API's behavior never changed.
+
+As of v1.2.0, replay masking recognizes two shapes of "already anonymized" data and passes them through
+byte-identical instead of re-masking them:
+
+- A well-formed `fp:`/`jkp:tomb:` envelope, regardless of which field it currently sits under (an envelope
+  echoed back under a different field name than the one that produced it is still recognized by its own shape).
+- A value that already matches the exact deterministic output format of this SDK's own synthetic generators
+  (email/phone/name/free-text/generic) — checked only against the ONE generator the field's own name would
+  select, never a blanket "looks synthetic" scan, to keep false positives bounded.
+
+This recognition only ever runs in the replay masking path — capture-side anonymization is completely
+unaffected, and a genuine production value is still synthesized exactly as before. It is deliberately
+conservative: numeric and boolean synthetic values are **never** recognized this way (there is no reliable way
+to distinguish a synthetic number from a real one by format alone), so an echoed numeric/boolean `SyntheticPii`
+field can still re-synthesize to a different value on replay — a narrower, documented gap rather than a silent
+one, and the rarer fallback-only case in practice.
+
+### The masking-confirmation header, in full (since v1.2.0)
+
+```
+X-Jakapil-Masked: v1;scheme=<scheme>;keyVersion=<n>[;live=<path>(,<path>)*][;liveHeaders=<name>(,<name>)*]
+```
+
+`scheme`/`keyVersion` are unchanged from before v1.2.0. The two new fields are appended only when there is
+something to declare — an ordinary response with no RunCredential leaves produces the exact same header as
+before:
+
+- **`live=`** — a comma-separated list of JSONPaths (root-relative, `$`) naming every response-body leaf that
+  passed through live via the RunCredential mechanism above. Object property access is `.name`; an array
+  contributes a single `[*]` wildcard covering every element, not one entry per index. A property name that
+  isn't a simple `[A-Za-z_][A-Za-z0-9_]*` identifier is percent-encoded (`Uri.EscapeDataString`, plus an
+  explicit `.`→`%2E` substitution for the one delimiter that function leaves unescaped) so it can never collide
+  with the `.`/`,`/`;` grammar delimiters — decode with `Uri.UnescapeDataString`. FlowFingerprint passthrough
+  leaves (the pre-existing ADR-0003 §5 behavior) are **not** included here; this field is scoped to the new
+  RunCredential category only.
+- **`liveHeaders=`** — a comma-separated list of header names (never encoded — an HTTP header name cannot
+  contain `,`/`;`) that passed through live; only ever `Set-Cookie` and/or `Location`.
+
+Examples: `v1;scheme=hmac-sha256-v1;keyVersion=1` (nothing to declare) · `v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.token;liveHeaders=Set-Cookie` ·
+`v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.auth.sessionToken,$.items[*].cursor`.
+
+When the header is absent, malformed, expired, replayed, or fails to verify for any reason, **behavior is
+byte-for-byte identical to today**: no masking, no capture suppression, no error response. The signature is
+purely a behavior switch — it never grants any extra authority over the request, which still goes through your
+application's own authentication/authorization exactly as if the header were not there.
+
+### Configuring it
+
+Signed replay verification is off by default in the sense that matters: with no public key configured, there is
+nothing to verify against, so it costs nothing and does nothing. To turn it on, add the public key(s) the
+Jakapil panel gives you for this project/environment:
+
+```csharp
+builder.Services.AddJakapilCapture(options =>
+{
+    options.IngestKey = builder.Configuration["Jakapil:Capture:IngestKey"]!;
+    options.CollectorUri = "https://collector.jakapil.example";
+
+    options.Replay.PublicKeys = [builder.Configuration["Jakapil:Capture:ReplayPublicKey"]!];
+    options.Replay.ExpectedTenantId = "...";       // optional — see below
+    options.Replay.ExpectedEnvironmentId = "...";  // optional — see below
+});
+```
+
+- `Replay.PublicKeys` accepts each key as either PEM (`-----BEGIN PUBLIC KEY-----...`) or a single-line
+  base64(DER) string — both are `SubjectPublicKeyInfo`-encoded ECDSA P-256 keys, never a secret (only Jakapil
+  holds the matching private key, so configuring this does not require any secret handling on your side).
+  Multiple keys can be listed at once — this is how key rotation works without downtime: Jakapil starts signing
+  with a new key while the old one is still listed here, and you remove the old entry once the rotation window
+  has closed.
+- `Replay.ExpectedTenantId`/`ExpectedEnvironmentId` are optional extra binding checks — when set, a signature
+  for a different tenant/environment id than configured here is treated as invalid. They are independent of
+  `Anonymization.Scope` (that field feeds HMAC domain separation, a different concern with a different
+  correctness bar — changing it changes every synthetic value you have ever seen, so replay identity binding
+  deliberately gets its own, separately-optional fields instead of reusing it). **Leaving them unset is not
+  wide open** (the key ring is still per-project), but it does mean a run signed for one environment could be
+  replayed against a different instance of the same project sharing the same public key. The real protection
+  for production is the switch below, not these fields — a production deployment should keep replay
+  verification disabled outright rather than relying on `ExpectedEnvironmentId` alone.
+- `Replay.ClockSkewTolerance` (default 300s), `Replay.NonceCacheSize` (default 10,000), and
+  `Replay.MaxMaskedResponseBytes` (default 8 MiB — the hard cap on how large a live response this SDK is
+  willing to buffer in order to mask it) all have sensible defaults; see `ReplayVerificationOptions`' XML
+  documentation for details on when you would want to change them.
+- Set `Replay.Enabled = false` (or simply never configure `Replay.PublicKeys`) to keep verification off in a
+  given environment — **production deployments should do this**, since replay verification is designed for
+  the staging/test targets the Jakapil Runner actually replays scenarios against (see the "privacy guarantee"
+  section below for why a clean, non-production target matters here regardless).
+
+### Cross-implementation test vectors
+
+The Jakapil Runner builds the ADR-0003 §6.2 canonical signature string INDEPENDENTLY of this SDK — the two
+implementations never share code, only the spec. A one-character format drift between them (field order, an
+escaped vs. raw route character, a missing byte in the body hash, ...) makes every signature invalid in the
+field, silently, with no error surfaced anywhere except "replay behavior never activates". To catch that class
+of bug before it ships, this repo publishes
+[`tests/vectors/replay-signature-vectors.json`](tests/vectors/replay-signature-vectors.json): a golden fixture
+of several representative requests (empty body, a JSON body, a body with multi-byte UTF-8 characters, a query
+string with percent-encoding, an unusual HTTP method) together with their exact canonical strings, body hashes,
+and — signed with a fixed, clearly-marked **TEST-ONLY** ECDSA key pair committed in the same file — valid
+signatures over them. Any independent implementation (the Jakapil Runner's, or anyone else's) can recompute the
+canonical string for each case from its recorded inputs and compare it byte-for-byte against the recorded value,
+and/or verify the recorded signature against the recorded public key, to prove interoperability without needing
+a live end-to-end run. `ReplaySignatureVectorsTests.cs` in this repo's test suite does exactly that against this
+SDK's own implementation, so the fixture can never silently drift out of sync with the code that generates it.
+
+### The privacy guarantee, precisely
+
+A signed replay response never carries your API's actual production-shaped values (personal data, free text,
+secrets) back to Jakapil — those are anonymized in exactly the same way, and to the same degree, as your
+already-anonymized captured corpus. What it *does* carry back are the correlation identifiers your API itself
+produced during that run (e.g. a newly created order's id), so Jakapil can keep chaining a multi-step scenario
+correctly; this is only meaningful if the target you are running replay scenarios against is a clean,
+isolated staging environment that never holds a copy of production data — see the "Field anonymization"
+section and the ADR this feature implements for the full reasoning.
+
 ## License
 
 MIT

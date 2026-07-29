@@ -1,5 +1,6 @@
 using System.Net;
 using Jakapil.Capture.Anonymization;
+using Jakapil.Capture.Replay;
 using Microsoft.Extensions.Options;
 
 namespace Jakapil.Capture;
@@ -89,6 +90,10 @@ public sealed class JakapilCaptureOptions
     /// <see cref="Anonymization.AnonymizationOptions"/>.</summary>
     public AnonymizationOptions Anonymization { get; set; } = new();
 
+    /// <summary>Phase 15d-15 (ADR-0003): signed replay-request verification — public key(s), clock-skew
+    /// tolerance, nonce cache size, response masking size cap. See <see cref="ReplayVerificationOptions"/>.</summary>
+    public ReplayVerificationOptions Replay { get; set; } = new();
+
     /// <summary>The root address of the collector to which captured interactions are sent (e.g. <c>http://localhost:5238</c>).
     /// If left empty, the export worker stays idle; the queue exists only with its bounded capacity (DropOldest).</summary>
     public string? CollectorUri { get; set; }
@@ -174,6 +179,8 @@ internal sealed class JakapilCaptureOptionsValidator : IValidateOptions<JakapilC
         {
             failures.Add("The anonymization key version (Anonymization.KeyVersion) must be non-negative.");
         }
+
+        ReplayVerificationOptionsValidator.Validate(options.Replay, failures);
 
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)

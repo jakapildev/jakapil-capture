@@ -1,4 +1,5 @@
 using Jakapil.Capture.Anonymization;
+using Jakapil.Capture.Replay;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -31,6 +32,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAuthTokenRegistry, AuthTokenRegistry>();
 
         services.AddSingleton<IAnonymizer, Anonymizer>();
+
+        // Phase 15d-15 (ADR-0003): signed replay-request verification. TimeProvider.System is already
+        // registered below (TryAddSingleton) — ReplayVerifier shares that single clock with ExportWorker.
+        services.AddSingleton<IReplayKeyRing, ReplayKeyRing>();
+        services.AddSingleton(sp => new ReplayNonceCache(sp.GetRequiredService<IOptions<JakapilCaptureOptions>>().Value.Replay.NonceCacheSize));
+        services.AddSingleton<IReplayVerifier, ReplayVerifier>();
 
         services.AddHttpClient(CaptureExporter.HttpClientName);
         services.AddSingleton<CaptureExporter>();
