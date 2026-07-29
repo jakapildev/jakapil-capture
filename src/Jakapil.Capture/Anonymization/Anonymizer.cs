@@ -86,6 +86,19 @@ public interface IAnonymizer
     /// <returns>The header's final value plus whether it passed through live (for the masking-confirmation
     /// header's <c>liveHeaders=</c> declaration) — see <see cref="ReplayHeaderDecision"/>.</returns>
     ReplayHeaderDecision ClassifyReplayResponseHeader(string headerName, string headerValue);
+
+    /// <summary>Sniffs whether <paramref name="contentType"/> would be treated as JSON by
+    /// <see cref="MaskReplayResponseBody"/> — the same rule <see cref="BodyCapture.ClassifyKind"/> uses for a
+    /// captured Content-Type header. Exposed so a caller can tell apart, when <see cref="MaskReplayResponseBody"/>
+    /// returns <c>null</c>, WHY: a non-JSON content type (this returns <c>false</c>) is a deliberate, documented
+    /// pass-through case (ADR-0003 §5 revision, "non-JSON pass-through" — symmetric with capture-time
+    /// <c>TransformBody</c>'s own non-JSON pass-through); a JSON content type that still failed to parse (this
+    /// returns <c>true</c>, yet <see cref="MaskReplayResponseBody"/> is still <c>null</c>) is malformed input
+    /// whose content could not be classified at all — fail-closed, same as before. The two must not be reported
+    /// to the caller (the ADR-0003 masking-confirmation header) the same way: the first still gets the header
+    /// (with <c>body=</c><see cref="Jakapil.Capture.Replay.ReplayProtocol.UnmaskedNonJsonBodyDisposition"/>), the
+    /// second gets none at all.</summary>
+    bool IsReplayResponseBodyJson(string? contentType);
 }
 
 /// <summary>The result of <see cref="IAnonymizer.MaskReplayResponseBody"/>: the masked body bytes, plus the
@@ -588,6 +601,9 @@ public sealed class Anonymizer : IAnonymizer
 
         return new ReplayHeaderDecision(headerValue, PassedLive: true);
     }
+
+    /// <inheritdoc />
+    public bool IsReplayResponseBodyJson(string? contentType) => IsJsonContentType(contentType);
 
     /// <summary>Same JSON-vs-not sniffing rule <see cref="BodyCapture.ClassifyKind"/> uses for a Content-Type
     /// header (a bare content-sniff of the bytes themselves is deliberately NOT done here, unlike

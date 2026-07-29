@@ -24,4 +24,14 @@ internal static class ReplayProtocol
     /// from anything in the request, so the same protocol name can never collide with a signature computed for
     /// a different purpose.</summary>
     public const string CanonicalPrefix = "jakapil-replay-v1";
+
+    /// <summary>The <c>body=</c> value of the masking-confirmation header (ADR-0003 §5 revision, "non-JSON
+    /// pass-through") declaring that the replay response body was forwarded to the Runner byte-for-byte,
+    /// unmasked, because its <c>Content-Type</c> was not JSON — mirroring capture-time
+    /// <c>Anonymizer.TransformBody</c>'s own non-JSON pass-through (there is no safe, general way to anonymize an
+    /// arbitrary text/binary blob without a schema). This is the ONLY non-default <c>body=</c> value this SDK
+    /// version ever emits; a JSON-masked body OMITS the field entirely rather than emitting a <c>body=masked</c>
+    /// counterpart — see <c>JakapilCaptureMiddleware.SetMaskedHeader</c>'s remarks for why absence, not an
+    /// explicit "masked" token, is the default.</summary>
+    public const string UnmaskedNonJsonBodyDisposition = "unmasked-nonjson";
 }

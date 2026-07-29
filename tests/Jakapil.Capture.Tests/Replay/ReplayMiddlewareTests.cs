@@ -303,7 +303,7 @@ public class ReplayMiddlewareTests
     }
 
     [Fact]
-    public async Task NonJsonResponse_CannotBeMasked_SentThroughUnmodified_NoConfirmationHeader_StillSuppressed()
+    public async Task NonJsonResponse_CannotBeMasked_SentThroughUnmodified_ConfirmationHeaderDeclaresUnmaskedNonJson_StillSuppressed()
     {
         var env = BuildServer();
         var bodyBytes = Array.Empty<byte>();
@@ -320,7 +320,16 @@ public class ReplayMiddlewareTests
         var body = await response.Content.ReadAsStringAsync();
 
         Assert.Equal("just plain text, not JSON", body);
-        Assert.False(response.Headers.Contains(ReplayProtocol.MaskedResponseHeaderName));
+
+        // ADR-0003 §5 revision, "non-JSON pass-through": a non-JSON body can't be masked, but that fact is now
+        // reported honestly via body=unmasked-nonjson instead of omitting the header entirely (the original
+        // bug this revision fixes — see Jakapil.Capture.Tests.Replay.ReplayMaskedHeaderMatrixTests for the full
+        // matrix). The full response matrix lives there; this test just keeps this specific end-to-end
+        // scenario (through the real ASP.NET Core pipeline, alongside this file's other replay tests) covered.
+        Assert.True(response.Headers.TryGetValues(ReplayProtocol.MaskedResponseHeaderName, out var values));
+        var headerValue = Assert.Single(values!);
+        Assert.Contains($";body={ReplayProtocol.UnmaskedNonJsonBodyDisposition}", headerValue);
+
         // Capture suppression is unconditional on a valid signature, independent of maskability.
         Assert.Empty(env.Queue.Captured);
     }

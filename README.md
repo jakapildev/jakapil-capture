@@ -206,13 +206,24 @@ one, and the rarer fallback-only case in practice.
 ### The masking-confirmation header, in full (since v1.2.0)
 
 ```
-X-Jakapil-Masked: v1;scheme=<scheme>;keyVersion=<n>[;live=<path>(,<path>)*][;liveHeaders=<name>(,<name>)*]
+X-Jakapil-Masked: v1;scheme=<scheme>;keyVersion=<n>[;body=unmasked-nonjson][;live=<path>(,<path>)*][;liveHeaders=<name>(,<name>)*]
 ```
 
-`scheme`/`keyVersion` are unchanged from before v1.2.0. The two new fields are appended only when there is
-something to declare — an ordinary response with no RunCredential leaves produces the exact same header as
+`scheme`/`keyVersion` are unchanged from before v1.2.0. The three new fields are appended only when there is
+something to declare — an ordinary JSON response with no RunCredential leaves produces the exact same header as
 before:
 
+- **`body=`** — declares that the response body could not be masked and was forwarded **unchanged**. The only
+  value this SDK version ever emits is `unmasked-nonjson`: the response's `Content-Type` was not JSON, so there
+  is no safe, general way to anonymize it — exactly the same reasoning capture-time anonymization already
+  applies to a non-JSON request/response body (ADR-0002's field classification is defined over named JSON
+  leaves, not arbitrary text/binary blobs; capture keeps the body as-is for the same reason). This field is
+  **omitted** on the ordinary JSON-masked path rather than always being emitted with an explicit `body=masked`
+  counterpart — that keeps the header byte-for-byte identical, for every case that already worked, to what it
+  was before this field existed, and matches the receiver's documented default: **absent `body=` means
+  masked**. A malformed JSON body (`Content-Type` says JSON, but the bytes fail to parse) and a truncated body
+  (the response exceeded `Replay.MaxMaskedResponseBytes`) are both **different** from this case and do **not**
+  get this field, or any header at all — see below.
 - **`live=`** — a comma-separated list of JSONPaths (root-relative, `$`) naming every response-body leaf that
   passed through live via the RunCredential mechanism above. Object property access is `.name`; an array
   contributes a single `[*]` wildcard covering every element, not one entry per index. A property name that
@@ -224,8 +235,17 @@ before:
 - **`liveHeaders=`** — a comma-separated list of header names (never encoded — an HTTP header name cannot
   contain `,`/`;`) that passed through live; only ever `Set-Cookie` and/or `Location`.
 
-Examples: `v1;scheme=hmac-sha256-v1;keyVersion=1` (nothing to declare) · `v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.token;liveHeaders=Set-Cookie` ·
+Examples: `v1;scheme=hmac-sha256-v1;keyVersion=1` (nothing to declare) ·
+`v1;scheme=hmac-sha256-v1;keyVersion=1;body=unmasked-nonjson` (non-JSON body, forwarded unchanged) ·
+`v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.token;liveHeaders=Set-Cookie` ·
 `v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.auth.sessionToken,$.items[*].cursor`.
+
+The header is **absent** — fail-closed, exactly like before v1.2.0 — for every case where the response body
+could not even be classified, as opposed to being deliberately non-JSON: a malformed JSON body (`Content-Type`
+claims JSON, parsing fails) and a body that was truncated for exceeding `Replay.MaxMaskedResponseBytes` (see
+"Configuring it" below) both fall into this bucket. In both cases the live, unmodified bytes are still
+forwarded to the caller — only the confirmation header is withheld, so the Jakapil cloud side never mistakes an
+unclassifiable body for one it can safely persist.
 
 When the header is absent, malformed, expired, replayed, or fails to verify for any reason, **behavior is
 byte-for-byte identical to today**: no masking, no capture suppression, no error response. The signature is

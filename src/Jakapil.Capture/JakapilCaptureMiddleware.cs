@@ -189,6 +189,35 @@ public sealed class JakapilCaptureMiddleware
                     "Jakapil: replay response ({TotalBytes} bytes) exceeded Replay.MaxMaskedResponseBytes; sending the buffered prefix through UNMASKED and without the masking-confirmation header",
                     maskingStream.TotalBytesWritten);
             }
+            else if (_anonymizer.HasKey && buffered.Length > 0 && !_anonymizer.IsReplayResponseBodyJson(context.Response.ContentType))
+            {
+                // buffered.Length > 0 guard: an EMPTY body is trivially "masked" regardless of Content-Type
+                // (MaskReplayResponseBody's own bodyBytes.Length == 0 early return, below) — there is nothing
+                // in it that could leak, so it must fall through to the ordinary masked-JSON branch instead of
+                // this one, and get the plain (no body= field) confirmation header, exactly like before this
+                // change (e.g. a 400 with no response body at all).
+                //
+                // ADR-0003 §5 revision, "non-JSON pass-through": the response's Content-Type is not JSON, so
+                // there is no safe, general way to mask it (same reasoning as capture-time
+                // Anonymizer.TransformBody's own non-JSON pass-through — ADR-0002's field classification is
+                // defined over named JSON leaves, not arbitrary text/binary blobs). Sending this body through
+                // unmasked while staying SILENT (no header) would be indistinguishable, to the Jakapil cloud
+                // side, from "masking was never attempted" — so instead of the pre-1.2.0 fail-closed behavior
+                // (no header at all), this branch sends the confirmation header WITH an explicit
+                // body=unmasked-nonjson declaration: the response IS forwarded live, and that fact is honestly
+                // reported rather than hidden. Turning this body into an opaque masked blob instead — the only
+                // alternative — would put capture-time (raw) and replay-time (masked) representations of the
+                // same non-JSON body in different spaces, breaking every assertion built on it and
+                // reintroducing exactly the false-regression problem ADR-0003 exists to prevent.
+                //
+                // Set-Cookie/Location RunCredential handling runs here too, same as the masked-JSON path below
+                // — it inspects HEADERS, not the body, so it is independent of whether the body itself could be
+                // masked; a non-JSON body must not lose that protection just because its body can't be masked.
+                var liveHeaderNames = ProcessRunCredentialResponseHeaders(context);
+                SetMaskedHeader(context, _anonymizer.Scheme, liveJsonPaths: null, liveHeaderNames, bodyDisposition: ReplayProtocol.UnmaskedNonJsonBodyDisposition);
+                await WriteReplayResponseAsync(context, originalResponseBody, buffered, setContentLength: false);
+                return;
+            }
             else if (_anonymizer.HasKey)
             {
                 var masked = _anonymizer.MaskReplayResponseBody(buffered, context.Response.ContentType);
@@ -198,6 +227,14 @@ public sealed class JakapilCaptureMiddleware
                     liveJsonPaths = masked.LiveJsonPaths;
                     maskingApplied = true;
                 }
+
+                // else: content-type claimed JSON (we already ruled out non-JSON content-type above) but the
+                // body still failed to parse (Anonymizer.MaskReplayResponseBody's own catch (JsonException)) —
+                // this is UNAMBIGUOUSLY the malformed-JSON case, distinct from the non-JSON-content-type case
+                // handled above. Fail-closed, same as before this change: maskingApplied stays false, no
+                // header is sent, and the live (unparseable) body is forwarded unchanged below — its content
+                // could not be classified at all, so it is treated like the Truncated case, not like the
+                // deliberate non-JSON pass-through case.
             }
             else
             {
@@ -275,10 +312,22 @@ public sealed class JakapilCaptureMiddleware
     /// <para><b>Grammar (v1.2.0 — authoritative; additive over the pre-v1.2.0 <c>v1;scheme=...;keyVersion=...</c>
     /// format, which is still exactly its own prefix):</b></para>
     /// <code>
-    /// X-Jakapil-Masked: v1;scheme=&lt;scheme&gt;;keyVersion=&lt;n&gt;[;live=&lt;path&gt;(,&lt;path&gt;)*][;liveHeaders=&lt;name&gt;(,&lt;name&gt;)*]
+    /// X-Jakapil-Masked: v1;scheme=&lt;scheme&gt;;keyVersion=&lt;n&gt;[;body=unmasked-nonjson][;live=&lt;path&gt;(,&lt;path&gt;)*][;liveHeaders=&lt;name&gt;(,&lt;name&gt;)*]
     /// </code>
     /// <list type="bullet">
     /// <item><c>scheme</c>/<c>keyVersion</c>: unchanged from before v1.2.0.</item>
+    /// <item><c>body=</c> (ADR-0003 §5 revision, "non-JSON pass-through"; positioned right after
+    /// <c>keyVersion=</c>, before <c>live=</c>/<c>liveHeaders=</c>, per the protocol contract): OMITTED on the
+    /// JSON-masked path — the only value this SDK version ever emits is
+    /// <see cref="Jakapil.Capture.Replay.ReplayProtocol.UnmaskedNonJsonBodyDisposition"/>
+    /// (<c>"unmasked-nonjson"</c>), sent when the response body's <c>Content-Type</c> was not JSON and so was
+    /// forwarded byte-for-byte unmasked (mirrors <c>Anonymizer.TransformBody</c>'s capture-time non-JSON
+    /// pass-through — there is no safe, general way to anonymize an arbitrary text/binary blob without a
+    /// schema). The field is deliberately OMITTED rather than always emitted with an explicit
+    /// <c>body=masked</c> counterpart on the JSON path: that keeps the header byte-for-byte identical, for
+    /// every case that already worked, to what it was before this field existed, and matches the receiver's
+    /// documented default — <b>absent <c>body=</c> means masked</b> — which is exactly what keeps every
+    /// pre-1.2.0-and-this-change receiver working unchanged against a masked JSON response.</item>
     /// <item><c>live=</c> (OMITTED entirely when there are no RunCredential leaves — never an empty
     /// <c>live=</c>): a comma-separated list of JSONPaths, root-relative (<c>$</c>), of every response-body leaf
     /// that passed through LIVE via the v1.2.0 RunCredential mechanism (<see cref="IAnonymizer.MaskReplayResponseBody"/>'s
@@ -306,7 +355,11 @@ public sealed class JakapilCaptureMiddleware
     /// <see cref="Uri.UnescapeDataString"/> each property segment.</para>
     /// </remarks>
     private void SetMaskedHeader(
-        HttpContext context, string scheme, IReadOnlyList<string>? liveJsonPaths = null, IReadOnlyList<string>? liveHeaderNames = null)
+        HttpContext context,
+        string scheme,
+        IReadOnlyList<string>? liveJsonPaths = null,
+        IReadOnlyList<string>? liveHeaderNames = null,
+        string? bodyDisposition = null)
     {
         if (context.Response.HasStarted)
         {
@@ -316,6 +369,11 @@ public sealed class JakapilCaptureMiddleware
         try
         {
             var value = $"v1;scheme={scheme};keyVersion={_anonymizer.KeyVersion}";
+            if (bodyDisposition is not null)
+            {
+                value += $";body={bodyDisposition}";
+            }
+
             if (liveJsonPaths is { Count: > 0 })
             {
                 value += $";live={string.Join(',', liveJsonPaths)}";
