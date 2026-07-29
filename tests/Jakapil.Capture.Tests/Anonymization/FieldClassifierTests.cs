@@ -164,4 +164,108 @@ public sealed class FieldClassifierTests
 
         Assert.Equal(FieldClass.Dropped, result);
     }
+
+    /// <summary>
+    /// Regression test for the field bug report (v1.2.0): a bare, generic <c>name</c> field must be classified
+    /// using its ENCLOSING object's field name, not on its own name alone. <c>$.customer.name</c> — a person
+    /// context — resolves to SyntheticPii; see <see cref="GenericName_NonPersonOrMissingContext_ClassifiesAsSafeLiteral"/>
+    /// for the counter-example (<c>$.catalogTypes[].name</c>) that motivated this fix.
+    /// </summary>
+    [Theory]
+    [InlineData("customer")]
+    [InlineData("Customer")]
+    [InlineData("user")]
+    [InlineData("billingAddress")]
+    [InlineData("shippingAddress")]
+    public void GenericName_PersonContextParent_ClassifiesAsSyntheticPii(string parentFieldName)
+    {
+        var result = FieldClassifier.Classify("name", LeafValueKind.String, "Ayşe Yılmaz", null, parentFieldName);
+
+        Assert.Equal(FieldClass.SyntheticPii, result);
+    }
+
+    /// <summary>
+    /// Lead-review regression: PLURAL REST collection parent names (<c>GET /api/users</c> →
+    /// <c>{ "users": [ { "name": "..." } ] }</c>) must ALSO be recognized as person context — this is the most
+    /// common shape a person record appears in, and <see cref="FieldNameRules.Normalize"/> does not singularize
+    /// on its own, so without <see cref="FieldNameRules.HasPersonContext"/>'s singular-candidate matching this
+    /// leaked real PII as plaintext. See <see cref="GenericName_PluralNonPersonContextParent_ClassifiesAsSafeLiteral"/>
+    /// for the required counter-example proving this does not degrade into "every plural matches".
+    /// </summary>
+    [Theory]
+    [InlineData("users")]
+    [InlineData("customers")]
+    [InlineData("employees")]
+    [InlineData("members")]
+    [InlineData("accounts")]
+    [InlineData("addresses")]
+    public void GenericName_PluralPersonContextParent_ClassifiesAsSyntheticPii(string parentFieldName)
+    {
+        var result = FieldClassifier.Classify("name", LeafValueKind.String, "Ahmet Yılmaz", null, parentFieldName);
+
+        Assert.Equal(FieldClass.SyntheticPii, result);
+    }
+
+    /// <summary>A plural of a NON-person context word must still resolve to SafeLiteral — proves the
+    /// singularization fix (<see cref="FieldNameRules.HasPersonContext"/>) widens matching only for words that
+    /// actually singularize into a listed person-context word, not indiscriminately for any plural.</summary>
+    [Theory]
+    [InlineData("companies")]
+    [InlineData("catalogTypes")]
+    public void GenericName_PluralNonPersonContextParent_ClassifiesAsSafeLiteral(string parentFieldName)
+    {
+        var result = FieldClassifier.Classify("name", LeafValueKind.String, "Acme Corp", null, parentFieldName);
+
+        Assert.Equal(FieldClass.SafeLiteral, result);
+    }
+
+    /// <summary>
+    /// The exact false-positive from the bug report: <c>GET /api/catalog-types</c> returns
+    /// <c>{ "catalogTypes": [ { "name": "Mug" }, ... ] }</c> — a product-category label, not a person — and the
+    /// old rule (bare <c>name</c> treated like <c>fullName</c>) rewrote it to a synthetic person name on every
+    /// capture, producing a 100%-reproducible false regression when the generated scenario replayed against the
+    /// live API. A root-level <c>name</c> with no enclosing object (<c>parentFieldName: null</c>) must also stay
+    /// SafeLiteral — the same rule, just with no context at all rather than a non-person one.
+    /// </summary>
+    [Theory]
+    [InlineData("catalogTypes")]
+    [InlineData("products")]
+    [InlineData(null)]
+    public void GenericName_NonPersonOrMissingContext_ClassifiesAsSafeLiteral(string? parentFieldName)
+    {
+        var result = FieldClassifier.Classify("name", LeafValueKind.String, "Mug", null, parentFieldName);
+
+        Assert.Equal(FieldClass.SafeLiteral, result);
+    }
+
+    /// <summary>Strong-signal PII names (<c>fullName</c>/<c>firstName</c>/<c>lastName</c>/<c>surname</c>) are
+    /// NOT context-sensitive — the v1.2.0 fix touches only the generic <c>name</c>, never these — so they must
+    /// classify as SyntheticPii both with and without a (non-person) parent context.</summary>
+    [Theory]
+    [InlineData("fullName", null)]
+    [InlineData("firstName", null)]
+    [InlineData("lastName", "catalogTypes")]
+    [InlineData("surname", "catalogTypes")]
+    public void StrongSignalPiiNames_ClassifyAsSyntheticPii_RegardlessOfContext(string fieldName, string? parentFieldName)
+    {
+        var result = FieldClassifier.Classify(fieldName, LeafValueKind.String, "Ayşe Yılmaz", null, parentFieldName);
+
+        Assert.Equal(FieldClass.SyntheticPii, result);
+    }
+
+    /// <summary>ADR §5 priority #1: customer FieldPolicy always wins, even over the new context-sensitive
+    /// default for generic <c>name</c> — a customer whose schema needs bare <c>name</c> treated as PII in a
+    /// context this heuristic does not recognize can still force it via <see cref="AnonymizationOptions.FieldPolicy"/>.</summary>
+    [Fact]
+    public void CustomerFieldPolicy_OverridesContextSensitiveNameDefault_ToSyntheticPii()
+    {
+        var policy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["name"] = FieldClass.SyntheticPii,
+        };
+
+        var result = FieldClassifier.Classify("name", LeafValueKind.String, "Mug", policy, "catalogTypes");
+
+        Assert.Equal(FieldClass.SyntheticPii, result);
+    }
 }

@@ -23,13 +23,156 @@ internal static class FieldNameRules
         "password", "token", "secret", "apikey", "authorization", "cookie",
     };
 
-    /// <summary>ADR §5/§7: known PII field names → <see cref="FieldClass.SyntheticPii"/>.</summary>
+    /// <summary>ADR §5/§7: known PII field names → <see cref="FieldClass.SyntheticPii"/>. These are STRONG
+    /// signals — the name alone is specific enough to a person that no surrounding context is needed (unlike
+    /// <see cref="ContextSensitiveFieldNames"/> below). Deliberately does NOT include the generic <c>name</c>
+    /// — see the context-sensitivity note on <see cref="ContextSensitiveFieldNames"/> for why it was moved out.</summary>
     public static readonly HashSet<string> PiiFieldNames = new(StringComparer.Ordinal)
     {
         "email", "phone", "phonenumber", "ssn", "tckn", "iban", "address", "dob", "birthdate", "dateofbirth",
-        "fullname", "firstname", "lastname", "surname", "name", "cardnumber", "creditcard", "cvv", "pan",
+        "fullname", "firstname", "lastname", "surname", "cardnumber", "creditcard", "cvv", "pan",
         "nationalid", "passport",
     };
+
+    /// <summary>
+    /// Field names that are too GENERIC to classify from the name alone — they need the enclosing object's own
+    /// field name (<see cref="FieldClassifier.Classify"/>'s <c>parentFieldName</c> parameter) to decide whether
+    /// they denote a person. Currently only <c>name</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists (field bug report, v1.2.0):</b> a captured eShop response
+    /// <c>GET /api/catalog-types</c> — <c>{ "catalogTypes": [ { "name": "Mug" }, { "name": "T-Shirt" }, ... ] }</c>
+    /// — had every <c>name</c> (a product-category label, not a person) rewritten to a synthetic person name
+    /// ("Sage Blake", "Ash Park", ...) because the old rule treated bare <c>name</c> exactly like
+    /// <c>fullName</c>/<c>firstName</c>. Scenarios generated from that capture then replayed against the live
+    /// API and asserted the wrong (synthetic) literal on every run — a 100%-reproducible FALSE regression, not
+    /// a real one. <c>name</c> is classified <see cref="FieldClass.SyntheticPii"/> ONLY when
+    /// <see cref="FieldClassifier.Classify"/>'s <c>parentFieldName</c> — the field name of the object that
+    /// directly contains it — normalizes to one of <see cref="PersonContextNames"/> (e.g. <c>$.customer.name</c>,
+    /// <c>$.billingAddress.name</c>). With no parent (root-level <c>name</c>) or a non-person parent
+    /// (<c>$.catalogTypes[].name</c>, <c>$.products[].name</c>) it falls through to the ordinary
+    /// name/type/entropy rules — <see cref="FieldClass.SafeLiteral"/> for a short, non-free-text label — and the
+    /// real value is sent, matching the eShop example above.</para>
+    /// <para><b>Privacy trade-off — read before relying on this default.</b> This intentionally LOOSENS the
+    /// default: a false positive (real category label classified as PII) becomes rarer, but so does the safety
+    /// margin — a field literally called <c>name</c> that DOES hold a person's name, sitting under a parent
+    /// object whose name isn't recognized as person-like (a custom/unusual schema), will now be sent as
+    /// plaintext instead of being synthesized. The strong-signal names in <see cref="PiiFieldNames"/>
+    /// (<c>fullName</c>/<c>firstName</c>/<c>lastName</c>/<c>surname</c>) are NOT affected by this change and
+    /// remain unconditionally <see cref="FieldClass.SyntheticPii"/> in every context. If a customer's schema
+    /// uses bare <c>name</c> for a person field in a context this heuristic does not recognize, the documented
+    /// escape hatch is <see cref="AnonymizationOptions.FieldPolicy"/> (ADR-0002 §5 priority #1, always wins):
+    /// map that field name to <see cref="FieldClass.SyntheticPii"/> explicitly.</para>
+    /// <para><b>Why not generalize to other generic names (e.g. <c>title</c>):</b> deliberately out of scope —
+    /// the reported failure is specific to <c>name</c>, and a name like <c>title</c> is ambiguous in the
+    /// opposite direction just as often (job title, book title, page title) without a reported false-positive
+    /// to justify the added rule. Extend this set only with a concrete, documented case, not speculatively.</para>
+    /// </remarks>
+    public static readonly HashSet<string> ContextSensitiveFieldNames = new(StringComparer.Ordinal) { "name" };
+
+    /// <summary>
+    /// Parent-object field-name WORDS that make a <see cref="ContextSensitiveFieldNames"/> field (currently just
+    /// <c>name</c>) resolve to <see cref="FieldClass.SyntheticPii"/> instead of falling through to the ordinary
+    /// rules. Checked via <see cref="HasPersonContext"/> against each WORD of the JSON object that directly
+    /// contains the field (see that method for why word-splitting, not whole-name matching, is required) — e.g.
+    /// for <c>$.customer.name</c> the parent word is <c>customer</c> (match); for <c>$.billingAddress.name</c>
+    /// the parent words are <c>billing</c>/<c>address</c> (match, either is enough); for
+    /// <c>$.catalogTypes[].name</c> the parent words are <c>catalog</c>/<c>types</c> (no match).
+    /// </summary>
+    public static readonly HashSet<string> PersonContextNames = new(StringComparer.Ordinal)
+    {
+        "user", "customer", "person", "contact", "member", "employee", "account", "buyer", "seller",
+        "recipient", "sender", "owner", "author", "patient", "client", "guest", "subscriber", "profile",
+        "billing", "shipping", "address",
+    };
+
+    /// <summary>Returns true if any WORD of <paramref name="parentFieldName"/> (split the same way
+    /// <see cref="ExtractIdentifierRole"/> splits camelCase/PascalCase/snake_case/kebab-case names) — or a
+    /// <see cref="SingularCandidates"/> of that word — is in <see cref="PersonContextNames"/>. Word-splitting —
+    /// rather than matching the whole normalized name — is required for compound parent names like
+    /// <c>billingAddress</c>/<c>shippingAddress</c> (splits to <c>billing</c>/<c>address</c> and
+    /// <c>shipping</c>/<c>address</c>): <see cref="Normalize"/> alone would concatenate these into
+    /// <c>billingaddress</c>/<c>shippingaddress</c>, neither of which is itself listed. Singularization is
+    /// required for the single most common REST shape of all — a plural collection endpoint
+    /// (<c>$.users[].name</c>, <c>$.customers[].name</c>, <c>$.employees[].name</c>): without it, the parent
+    /// word is <c>users</c>/<c>customers</c>/<c>employees</c>, none of which is literally in
+    /// <see cref="PersonContextNames"/>, and a real person's name would be sent as plaintext
+    /// <see cref="FieldClass.SafeLiteral"/> — see <see cref="SingularCandidates"/> for why this must
+    /// deliberately over-match rather than under-match.</summary>
+    public static bool HasPersonContext(string? parentFieldName)
+    {
+        if (string.IsNullOrEmpty(parentFieldName))
+        {
+            return false;
+        }
+
+        foreach (var word in SplitWords(parentFieldName))
+        {
+            var normalizedWord = Normalize(word);
+            if (normalizedWord.Length == 0)
+            {
+                continue;
+            }
+
+            foreach (var candidate in SingularCandidates(normalizedWord))
+            {
+                if (PersonContextNames.Contains(candidate))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Yields <paramref name="normalizedWord"/> itself, plus every simple suffix-stripped singular form worth
+    /// trying against <see cref="PersonContextNames"/> — <c>users</c> → <c>user</c>, <c>employees</c> →
+    /// <c>employee</c>, <c>companies</c> → <c>company</c>, <c>addresses</c> → <c>address</c>. Intentionally
+    /// crude: three fixed suffix rules, no inflection library, no exceptions dictionary, no IO (the classifier
+    /// stays pure) — tries plain trailing-<c>s</c> stripping, <c>ies</c>→<c>y</c>, and <c>es</c>→<c>""</c>, and
+    /// lets the caller's set-membership check decide which (if any) candidate is real; a wrong candidate that
+    /// matches nothing in <see cref="PersonContextNames"/> is simply ignored.
+    /// </summary>
+    /// <remarks>
+    /// <b>Deliberately biased toward OVER-matching, never under-matching — do not "optimize" this later.</b>
+    /// The two failure directions are NOT symmetric:
+    /// <list type="bullet">
+    /// <item>A false MATCH (some unrelated plural word happens to singularize into a listed person-context
+    /// word) merely anonymizes a field that did not strictly need it — a correctness annoyance, fully
+    /// recoverable via <see cref="AnonymizationOptions.FieldPolicy"/>.</item>
+    /// <item>A false MISS (a real plural person collection, e.g. <c>users</c>, not recognized) sends REAL PII to
+    /// the collector in PLAINTEXT — unrecoverable, the value has already left the customer's process by the
+    /// time anyone could notice.</item>
+    /// </list>
+    /// When in doubt, or when adding a new suffix rule, this method must widen matching, never narrow it.
+    /// </remarks>
+    private static IEnumerable<string> SingularCandidates(string normalizedWord)
+    {
+        yield return normalizedWord;
+
+        // "companies" -> "company", "addresses" via the `es` rule below (this one alone would wrongly yield
+        // "companie"; the `es` rule catches short forms the `ies` rule does not apply to).
+        if (normalizedWord.Length > 4 && normalizedWord.EndsWith("ies", StringComparison.Ordinal))
+        {
+            yield return string.Concat(normalizedWord.AsSpan(0, normalizedWord.Length - 3), "y");
+        }
+
+        // "addresses" -> "address", "employees" (also covered by the plain -s rule below, tried anyway — cheap
+        // and harmless since the caller only cares whether ANY candidate matches).
+        if (normalizedWord.Length > 4 && normalizedWord.EndsWith("es", StringComparison.Ordinal))
+        {
+            yield return normalizedWord[..^2];
+        }
+
+        // "users" -> "user", "customers" -> "customer", "employees" -> "employee". The general case; length
+        // guard avoids reducing very short words (e.g. a 3-letter word) to something meaningless.
+        if (normalizedWord.Length > 3 && normalizedWord.EndsWith('s'))
+        {
+            yield return normalizedWord[..^1];
+        }
+    }
 
     /// <summary>ADR §5 (fail-safe, INV-A3): free-text fields are NOT SafeLiteral by default — the server
     /// cannot distinguish <c>"currency": "TRY"</c> from <c>"note": "met with John Smith"</c>, so free text
@@ -50,6 +193,55 @@ internal static class FieldNameRules
 
     /// <summary>The three semantic roles ADR §6.1/§9 recognizes for flow identifiers.</summary>
     private static readonly HashSet<string> IdentifierRoleWords = new(StringComparer.Ordinal) { "id", "ref", "key" };
+
+    /// <summary>
+    /// ADR-0003 §5 revision (v1.2.0, <c>RunCredential</c>): the semantic-kind allowlist for values a signed-replay
+    /// response may pass through LIVE instead of masking, because the TARGET produced them during this run and the
+    /// Runner must chain them into the next step's request — the same structural reason <see cref="FieldClass.FlowFingerprint"/>
+    /// already passes through live (<c>Anonymizer.ApplyClass</c>'s <c>isReplayMasking</c> path). Deliberately does
+    /// NOT include <c>password</c> or any other <see cref="SecretFieldNames"/> entry outside this exact list —
+    /// those are INPUT secrets the caller supplied, not artifacts the target issued, and must stay tombstoned even
+    /// in a replay response (see <see cref="ExtractRunCredentialKind"/> remarks for why <c>password</c> can never
+    /// match here by construction, not by an extra exclusion check).
+    /// </summary>
+    private static readonly HashSet<string> RunCredentialKindWords = new(StringComparer.Ordinal)
+    {
+        "token", "session", "cookie", "csrf", "cursor",
+    };
+
+    /// <summary>
+    /// Extracts the RunCredential semantic kind ("token"/"session"/"cookie"/"csrf"/"cursor") from a field name's
+    /// LAST camelCase/PascalCase/snake_case/kebab-case word, or null if the name does not end in one of those
+    /// words — mirrors <see cref="ExtractIdentifierRole"/> exactly (same <see cref="SplitWords"/> word-splitting,
+    /// last word only), so the same false-positive bound applies: a whole-word match on the TRAILING word only,
+    /// never a substring/prefix match (<c>tokenizer</c> does not match "token"; <c>authToken</c>/<c>sessionId</c>-
+    /// no wait, <c>sessionId</c>'s last word is "Id" not "session" — see the worked examples below).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why <c>password</c> can never match:</b> not by an exclusion list, but structurally — "password"
+    /// is not, and will never be added to, <see cref="RunCredentialKindWords"/>. A compound name like
+    /// <c>passwordResetToken</c> DOES match (last word "Token") — correctly so: that field holds a token the
+    /// target issued during this run (a run artifact), not the password value itself. This is the intended
+    /// behavior, not a gap: the decision boundary is "did the TARGET produce this during the run" (token: yes),
+    /// never "does the name contain the substring 'password'".</para>
+    /// <para><b>Worked examples:</b> <c>token</c> → "token" (whole name); <c>authToken</c>/<c>sessionToken</c>/
+    /// <c>csrfToken</c> → "token" (trailing word); <c>sessionId</c> → null (trailing word is "id", the
+    /// FlowFingerprint role, not a RunCredential kind — already handled by the existing FlowFingerprint
+    /// passthrough); <c>pageCursor</c>/<c>nextCursor</c> → "cursor"; <c>xsrfCookie</c> → "cookie" (splits to
+    /// ["xsrf","Cookie"], trailing word matches); <c>tokenizer</c> → null (one lowercase word "tokenizer", not
+    /// equal to "token" — whole-word match only, never substring/prefix).</para>
+    /// </remarks>
+    public static string? ExtractRunCredentialKind(string fieldName)
+    {
+        var words = SplitWords(fieldName);
+        if (words.Count == 0)
+        {
+            return null;
+        }
+
+        var last = words[^1].ToLowerInvariant();
+        return RunCredentialKindWords.Contains(last) ? last : null;
+    }
 
     /// <summary>Reduces a raw name to the ASCII-letter/digit-only, lowercase token the server-side
     /// <c>ValueEnvelope</c> grammar requires for <c>semanticKind</c>/tombstone <c>kind</c>

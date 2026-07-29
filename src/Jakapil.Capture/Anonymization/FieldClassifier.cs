@@ -26,8 +26,13 @@ internal enum LeafValueKind
 /// <item><b>Customer policy</b> (<see cref="AnonymizationOptions.FieldPolicy"/>) — always wins.</item>
 /// <item><i>(OpenAPI metadata — not available in the SDK; skipped, see class remarks.)</i></item>
 /// <item><b>Known field-name rules</b>: secret names → <see cref="FieldClass.SecretTombstone"/>; free-text
-/// and PII names → <see cref="FieldClass.SyntheticPii"/>; the small SafeLiteral allowlist (enum-like/measure
-/// names) → <see cref="FieldClass.SafeLiteral"/>.</item>
+/// and (context-independent, strong-signal) PII names → <see cref="FieldClass.SyntheticPii"/>; a small set of
+/// GENERIC, context-sensitive names (<see cref="FieldNameRules.ContextSensitiveFieldNames"/>, currently just
+/// <c>name</c>) → <see cref="FieldClass.SyntheticPii"/> ONLY if the enclosing object's own field name suggests
+/// a person (<see cref="FieldNameRules.PersonContextNames"/>), otherwise <see cref="FieldClass.SafeLiteral"/>
+/// directly (v1.2.0 fix — see that set's remarks for the false-positive this eliminates and the privacy
+/// trade-off it accepts); the small SafeLiteral allowlist (enum-like/measure names) →
+/// <see cref="FieldClass.SafeLiteral"/>.</item>
 /// <item><b>Name/type/entropy fallback (last resort)</b>: an <c>*Id</c>/<c>*Ref</c>/<c>*Key</c>-suffixed name
 /// → <see cref="FieldClass.FlowFingerprint"/>; otherwise INV-A3 (fail-safe) applies — an unclassified JSON
 /// number defaults to <see cref="FieldClass.SafeLiteral"/> (a bare measure has no PII shape), an unclassified
@@ -38,8 +43,19 @@ internal enum LeafValueKind
 /// </remarks>
 internal static class FieldClassifier
 {
+    /// <param name="fieldName">The leaf's own field name (route/query/header name, or JSON property name).</param>
+    /// <param name="kind">The leaf's shape — see <see cref="LeafValueKind"/>.</param>
+    /// <param name="rawText">The raw captured value, used only by the entropy-shape fallback (step 4).</param>
+    /// <param name="fieldPolicy"><see cref="AnonymizationOptions.FieldPolicy"/> — always wins (step 1).</param>
+    /// <param name="parentFieldName">The field name of the JSON object that DIRECTLY contains this leaf (e.g.
+    /// for <c>$.customer.name</c>, this is <c>"customer"</c>), or null at the document root or for a
+    /// route/query/header value (which has no JSON container). Used ONLY by the
+    /// <see cref="FieldNameRules.ContextSensitiveFieldNames"/> check — every other rule ignores it. See
+    /// <see cref="FieldNameRules.ContextSensitiveFieldNames"/> for why a generic name like <c>name</c> needs
+    /// this and the privacy trade-off it documents.</param>
     public static FieldClass Classify(
-        string? fieldName, LeafValueKind kind, string? rawText, IReadOnlyDictionary<string, FieldClass>? fieldPolicy)
+        string? fieldName, LeafValueKind kind, string? rawText, IReadOnlyDictionary<string, FieldClass>? fieldPolicy,
+        string? parentFieldName = null)
     {
         // 1. Customer policy — highest priority, always wins.
         if (fieldName is not null && fieldPolicy is not null && fieldPolicy.TryGetValue(fieldName, out var overridden))
@@ -67,6 +83,17 @@ internal static class FieldClassifier
             if (FieldNameRules.FreeTextFieldNames.Contains(normalized) || FieldNameRules.PiiFieldNames.Contains(normalized))
             {
                 return FieldClass.SyntheticPii;
+            }
+
+            // Generic names (currently only "name") only mean PII when the enclosing object's own field name
+            // suggests a person; with no parent or a non-person parent they resolve directly to SafeLiteral —
+            // a deliberate exception to the INV-A3 fail-safe fallback below (which would otherwise synthesize
+            // any unrecognized string), because this is no longer an UNRECOGNIZED name, it is a name explicitly
+            // evaluated and found not to indicate PII (see FieldNameRules.ContextSensitiveFieldNames remarks
+            // for the bug this fixes and the resulting privacy trade-off).
+            if (FieldNameRules.ContextSensitiveFieldNames.Contains(normalized))
+            {
+                return FieldNameRules.HasPersonContext(parentFieldName) ? FieldClass.SyntheticPii : FieldClass.SafeLiteral;
             }
 
             if (FieldNameRules.SafeLiteralFieldNames.Contains(normalized))
