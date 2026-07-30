@@ -322,6 +322,33 @@ correctly; this is only meaningful if the target you are running replay scenario
 isolated staging environment that never holds a copy of production data — see the "Field anonymization"
 section and the ADR this feature implements for the full reasoning.
 
+## Version history
+
+Full notes for each release: https://github.com/jakapildev/jakapil-capture/releases
+
+### 1.2.1
+
+**Masking confirmation for non-JSON response bodies.** A signed-replay response whose `Content-Type` was not
+JSON previously got **no confirmation header at all**, because masking never ran. The cloud side treats a
+missing confirmation as "do not persist the body" — correct for privacy, but it meant such a step could never
+be verified. A `409 Conflict` carrying a plain-text message is one of the most common error shapes in ASP.NET
+(`Response.WriteAsync("…")` defaults to `text/plain` when no content type is set), so scenarios expecting a
+4xx were silently unverifiable.
+
+The confirmation header gained an optional `body=` field (see "The masking-confirmation header, in full"). A
+non-JSON body is now forwarded unchanged **and that fact is declared honestly**, rather than passing through
+in silence. The field is optional and absent means `masked`, so 1.2.0 and earlier receivers are unaffected.
+
+Malformed JSON and truncated bodies deliberately still withhold the header — those are unclassifiable, not
+merely non-JSON.
+
+### 1.2.0
+
+Signed replay-request verification with in-process response masking; context-sensitive classification of the
+generic `name` field; type-preserving replacement values; run-issued credentials (`token`, `session`, `cookie`,
+`csrf`, `cursor`) passing through live so multi-step scenarios keep chaining; idempotent replay masking; and
+the `live=`/`liveHeaders=` declarations on the confirmation header.
+
 ## License
 
 MIT
