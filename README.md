@@ -209,11 +209,12 @@ one, and the rarer fallback-only case in practice.
 X-Jakapil-Masked: v1;scheme=<scheme>;keyVersion=<n>[;body=unmasked-nonjson][;live=<path>(,<path>)*][;liveHeaders=<name>(,<name>)*]
 ```
 
-`scheme`/`keyVersion` are unchanged from before v1.2.0. The three new fields are appended only when there is
-something to declare — an ordinary JSON response with no RunCredential leaves produces the exact same header as
-before:
+`scheme`/`keyVersion` are unchanged from before v1.2.0. `live=` and `liveHeaders=` arrived in v1.2.0; `body=`
+in v1.2.1. All three are appended only when there is something to declare — an ordinary JSON response with no
+RunCredential leaves produces the exact same header as before:
 
-- **`body=`** — declares that the response body could not be masked and was forwarded **unchanged**. The only
+- **`body=`** (since v1.2.1) — declares that the response body could not be masked and was forwarded
+  **unchanged**. The only
   value this SDK version ever emits is `unmasked-nonjson`: the response's `Content-Type` was not JSON, so there
   is no safe, general way to anonymize it — exactly the same reasoning capture-time anonymization already
   applies to a non-JSON request/response body (ADR-0002's field classification is defined over named JSON
@@ -224,7 +225,7 @@ before:
   masked**. A malformed JSON body (`Content-Type` says JSON, but the bytes fail to parse) and a truncated body
   (the response exceeded `Replay.MaxMaskedResponseBytes`) are both **different** from this case and do **not**
   get this field, or any header at all — see below.
-- **`live=`** — a comma-separated list of JSONPaths (root-relative, `$`) naming every response-body leaf that
+- **`live=`** (since v1.2.0) — a comma-separated list of JSONPaths (root-relative, `$`) naming every response-body leaf that
   passed through live via the RunCredential mechanism above. Object property access is `.name`; an array
   contributes a single `[*]` wildcard covering every element, not one entry per index. A property name that
   isn't a simple `[A-Za-z_][A-Za-z0-9_]*` identifier is percent-encoded (`Uri.EscapeDataString`, plus an
@@ -232,7 +233,7 @@ before:
   with the `.`/`,`/`;` grammar delimiters — decode with `Uri.UnescapeDataString`. FlowFingerprint passthrough
   leaves (the pre-existing ADR-0003 §5 behavior) are **not** included here; this field is scoped to the new
   RunCredential category only.
-- **`liveHeaders=`** — a comma-separated list of header names (never encoded — an HTTP header name cannot
+- **`liveHeaders=`** (since v1.2.0) — a comma-separated list of header names (never encoded — an HTTP header name cannot
   contain `,`/`;`) that passed through live; only ever `Set-Cookie` and/or `Location`.
 
 Examples: `v1;scheme=hmac-sha256-v1;keyVersion=1` (nothing to declare) ·
