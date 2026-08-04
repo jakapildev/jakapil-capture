@@ -26,14 +26,19 @@ public sealed class AnonymizerTests
         string? locationHeader = null,
         bool requestBodyTruncated = false,
         IReadOnlyDictionary<string, string>? requestHeaders = null,
-        string rawPath = "/api/orders")
+        string rawPath = "/api/orders",
+        IdentityInfo? identity = null,
+        CorrelationSignals? correlation = null,
+        AuthBinding? auth = null)
     {
         return new CapturedInteraction
         {
             Id = Guid.NewGuid(),
             Timestamp = DateTimeOffset.UtcNow,
             DurationMs = 5,
-            Correlation = new CorrelationSignals { ObservedAt = DateTimeOffset.UtcNow },
+            Correlation = correlation ?? new CorrelationSignals { ObservedAt = DateTimeOffset.UtcNow },
+            Identity = identity,
+            Auth = auth,
             Request = new CapturedRequest
             {
                 Method = "POST",
@@ -98,7 +103,7 @@ public sealed class AnonymizerTests
         var result = anonymizer.Anonymize(interaction);
 
         Assert.NotNull(result.Anon);
-        Assert.Equal("hmac-sha256-v1", result.Anon!.Scheme);
+        Assert.Equal("hmac-sha256-v2", result.Anon!.Scheme);
         Assert.Equal(3, result.Anon.KeyVersion);
     }
 
@@ -354,12 +359,15 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_NumericQueryParameter_UnrecognizedFieldName_SyntheticValueStillParsesAsNumber()
     {
+        // "BatchCount" is deliberately NOT one of the recognized pagination/counter names (GIZLILIK-2/G-1-1) —
+        // this test is about the general unknown-field fail-safe's shape preservation, not the pagination
+        // SafeLiteral exception (covered separately below).
         var anonymizer = new Anonymizer(Key, Options, []);
-        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["PageSize"] = "10" });
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" });
 
         var result = anonymizer.Anonymize(interaction);
 
-        var transformed = result.Request.QueryParameters!["PageSize"];
+        var transformed = result.Request.QueryParameters!["BatchCount"];
         Assert.NotEqual("10", transformed);
         Assert.True(long.TryParse(transformed, out _), $"Synthetic query value '{transformed}' does not parse as a number.");
     }
@@ -380,10 +388,103 @@ public sealed class AnonymizerTests
     public void Anonymize_QueryParameterSynthesis_IsDeterministic_SameInputSameOutput()
     {
         var anonymizer = new Anonymizer(Key, Options, []);
-        var first = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["PageSize"] = "10" }));
-        var second = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["PageSize"] = "10" }));
+        var first = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" }));
+        var second = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" }));
 
-        Assert.Equal(first.Request.QueryParameters!["PageSize"], second.Request.QueryParameters!["PageSize"]);
+        Assert.Equal(first.Request.QueryParameters!["BatchCount"], second.Request.QueryParameters!["BatchCount"]);
+    }
+
+    // ---- v1.3.1 pagination/counter transport SafeLiteral exception (GIZLILIK-2/G-1-1) -------------------
+    // Real end-to-end repro (see task report): GET /api/catalog-items?PageSize=10&PageIndex=0 anonymized into
+    // ?PageSize=35&PageIndex=1 — a DIFFERENT number — because neither name was in the built-in SafeLiteral
+    // allowlist, so both fell to the unknown-field fail-safe (SyntheticPii, shape-preserved but still a
+    // different value). This corrupts the request's meaning, not just its identity, producing a scenario that
+    // fails deterministically against the live API.
+
+    [Theory]
+    [InlineData("PageSize", "10")]
+    [InlineData("PageIndex", "0")]
+    [InlineData("pagesize", "10")]
+    [InlineData("page_size", "10")]
+    [InlineData("page[size]", "10")]
+    [InlineData("$top", "25")]
+    [InlineData("offset", "1000000")]
+    public void Anonymize_RecognizedPaginationCounterQueryParameter_NumericValue_PassesThroughUnchanged(string fieldName, string value)
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { [fieldName] = value });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Equal(value, result.Request.QueryParameters![fieldName]);
+    }
+
+    [Fact]
+    public void Anonymize_PaginationCounterQueryParameter_NonNumericValue_ShapeGateBlocksException_StillSynthesized()
+    {
+        // Name matches ("pageSize"), but the value does not look numeric at all — the shape gate must block the
+        // SafeLiteral exception, so a name/value mismatch can never be used to sneak free text through unmasked.
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["pageSize"] = "ahmet@x.com" });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.NotEqual("ahmet@x.com", result.Request.QueryParameters!["pageSize"]);
+    }
+
+    [Fact]
+    public void Anonymize_IdentifierQueryParameter_StillFingerprinted_NoRegressionFromPaginationException()
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["userId"] = "12345" });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.StartsWith("fp:", result.Request.QueryParameters!["userId"]);
+    }
+
+    [Fact]
+    public void Anonymize_PageSizeStringInJsonBody_StillSynthesized_ExceptionIsTransportOnly()
+    {
+        // The pagination/counter SafeLiteral exception is scoped to TransformTransportValue (route/query/header)
+        // only — a JSON body leaf with the exact same field name must be unaffected (no regression on body
+        // classification, and no accidental widening of the global SafeLiteralFieldNames allowlist).
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(requestBodyJson: """{"pageSize":"10"}""");
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.DoesNotContain("\"pageSize\":\"10\"", result.Request.Body!.Text);
+    }
+
+    [Theory]
+    [InlineData("page", "2")]
+    [InlineData("limit", "50")]
+    public void Anonymize_PreExistingSafeLiteralCounterName_NoRegression(string fieldName, string value)
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { [fieldName] = value });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Equal(value, result.Request.QueryParameters![fieldName]);
+    }
+
+    [Fact]
+    public void Anonymize_PageSizeQueryParameter_FieldPolicyOverride_WinsOverPaginationException()
+    {
+        var options = new AnonymizationOptions
+        {
+            KeyVersion = Options.KeyVersion,
+            Scope = Options.Scope,
+            FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["pageSize"] = FieldClass.SecretTombstone },
+        };
+        var anonymizer = new Anonymizer(Key, options, []);
+        var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["pageSize"] = "10" });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Contains("jkp:tomb:", result.Request.QueryParameters!["pageSize"]);
     }
 
     [Fact]
@@ -760,6 +861,150 @@ public sealed class AnonymizerTests
         Assert.False(decision.PassedLive);
         Assert.Contains("jkp:tomb:", decision.Value);
         Assert.DoesNotContain("abc123", decision.Value);
+    }
+
+    // ---- GIZLILIK-1/G1: Identity/Correlation/AuthBinding coverage -------------------------------------------
+    // Anonymize() used to return Identity/Correlation/Auth completely untouched — the JWT `sub`, user name, and
+    // every claim went to the collector in PLAINTEXT even with a key configured. This closes that gap per the
+    // field-by-field decision table (see task report).
+
+    private static CapturedInteraction BuildInteractionWithSubjectCopies(string subjectId) =>
+        BuildInteraction(
+            identity: new IdentityInfo { IsAuthenticated = true, SubjectId = subjectId },
+            correlation: new CorrelationSignals { ObservedAt = DateTimeOffset.UtcNow, SubjectId = subjectId },
+            auth: new AuthBinding { AuthBearing = true, SubjectId = subjectId });
+
+    [Fact]
+    public void Anonymize_SubjectId_SameRawValue_IdentityCorrelationAndAuthBinding_ProduceIdenticalDigest()
+    {
+        const string subjectId = "auth0|64f1e2c3-real-user-guid";
+        var anonymizer = new Anonymizer(Key, Options, []);
+
+        var result = anonymizer.Anonymize(BuildInteractionWithSubjectCopies(subjectId));
+
+        Assert.DoesNotContain(subjectId, result.Identity!.SubjectId);
+        Assert.DoesNotContain(subjectId, result.Correlation.SubjectId);
+        Assert.DoesNotContain(subjectId, result.Auth!.SubjectId);
+        Assert.Equal(result.Identity.SubjectId, result.Correlation.SubjectId);
+        Assert.Equal(result.Identity.SubjectId, result.Auth.SubjectId);
+        Assert.StartsWith("fp:u:subject:", result.Identity.SubjectId);
+    }
+
+    [Theory]
+    [InlineData("role")]
+    [InlineData("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")]
+    public void Anonymize_RoleClaim_BothTypeSpellings_PassThroughUnchanged(string roleClaimType)
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { [roleClaimType] = "admin" },
+        });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Equal("admin", result.Identity!.Claims[roleClaimType]);
+    }
+
+    [Fact]
+    public void Anonymize_UnrecognizedClaimType_IsFingerprinted_FailClosed()
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { ["department"] = "engineering" },
+        });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        var transformed = result.Identity!.Claims["department"];
+        Assert.NotEqual("engineering", transformed);
+        Assert.StartsWith("fp:u:claim:", transformed);
+    }
+
+    [Fact]
+    public void Anonymize_LowCardinalityIdentityAndCorrelationFields_PassThroughUnchanged()
+    {
+        var observedAt = DateTimeOffset.UtcNow;
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(
+            identity: new IdentityInfo { IsAuthenticated = true, AuthenticationScheme = "Bearer" },
+            correlation: new CorrelationSignals
+            {
+                ObservedAt = observedAt,
+                TraceId = "trace-abc",
+                SpanId = "span-1",
+                ParentSpanId = "span-0",
+            },
+            auth: new AuthBinding
+            {
+                AuthBearing = true,
+                Scheme = "Bearer",
+                SourceInteractionId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                SourceFieldPath = "$.token",
+            });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.True(result.Identity!.IsAuthenticated);
+        Assert.Equal("Bearer", result.Identity.AuthenticationScheme);
+        Assert.Equal("trace-abc", result.Correlation.TraceId);
+        Assert.Equal("span-1", result.Correlation.SpanId);
+        Assert.Equal("span-0", result.Correlation.ParentSpanId);
+        Assert.Equal(observedAt, result.Correlation.ObservedAt);
+        Assert.True(result.Auth!.AuthBearing);
+        Assert.Equal("Bearer", result.Auth.Scheme);
+        Assert.Equal(Guid.Parse("11111111-1111-1111-1111-111111111111"), result.Auth.SourceInteractionId);
+        Assert.Equal("$.token", result.Auth.SourceFieldPath);
+    }
+
+    [Fact]
+    public void Anonymize_NoKeyConfigured_IdentityCorrelationAndAuthBinding_PassThroughUnchanged()
+    {
+        const string subjectId = "real-subject-id";
+        var anonymizer = new Anonymizer(key: null, Options, []);
+        var interaction = BuildInteractionWithSubjectCopies(subjectId);
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Same(interaction, result);
+        Assert.Equal(subjectId, result.Identity!.SubjectId);
+        Assert.Equal(subjectId, result.Correlation.SubjectId);
+        Assert.Equal(subjectId, result.Auth!.SubjectId);
+    }
+
+    [Fact]
+    public void Anonymize_SubjectIdAndClaims_AreDeterministic_SameInputSameOutput()
+    {
+        const string subjectId = "deterministic-subject";
+        var anonymizer = new Anonymizer(Key, Options, []);
+        Func<CapturedInteraction> build = () => BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            SubjectId = subjectId,
+            UserName = "ayse.yilmaz",
+            Claims = new Dictionary<string, string> { ["department"] = "engineering", ["role"] = "admin" },
+        });
+
+        var first = anonymizer.Anonymize(build());
+        var second = anonymizer.Anonymize(build());
+
+        Assert.Equal(first.Identity!.SubjectId, second.Identity!.SubjectId);
+        Assert.Equal(first.Identity.UserName, second.Identity.UserName);
+        Assert.Equal(first.Identity.Claims["department"], second.Identity.Claims["department"]);
+        Assert.Equal(first.Identity.Claims["role"], second.Identity.Claims["role"]);
+    }
+
+    [Fact]
+    public void Anonymize_SetsAnonScheme_HmacSha256V2()
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+
+        var result = anonymizer.Anonymize(BuildInteraction());
+
+        Assert.Equal("hmac-sha256-v2", result.Anon!.Scheme);
     }
 
     private static string ExtractFirstFingerprintEnvelope(string json)

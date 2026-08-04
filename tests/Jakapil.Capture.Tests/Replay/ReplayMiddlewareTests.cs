@@ -201,7 +201,7 @@ public class ReplayMiddlewareTests
 
         Assert.True(response.Headers.TryGetValues(ReplayProtocol.MaskedResponseHeaderName, out var values));
         var headerValue = Assert.Single(values!);
-        Assert.StartsWith("v1;scheme=hmac-sha256-v1;keyVersion=", headerValue);
+        Assert.StartsWith("v1;scheme=hmac-sha256-v2;keyVersion=", headerValue);
     }
 
     [Fact]
@@ -371,7 +371,7 @@ public class ReplayMiddlewareTests
         Assert.True(response.Headers.TryGetValues(ReplayProtocol.MaskedResponseHeaderName, out var values));
         var headerValue = Assert.Single(values!);
 
-        Assert.StartsWith("v1;scheme=hmac-sha256-v1;keyVersion=", headerValue);
+        Assert.StartsWith("v1;scheme=hmac-sha256-v2;keyVersion=", headerValue);
         Assert.Contains(";live=$.token", headerValue);
         Assert.Contains(";liveHeaders=", headerValue);
 
@@ -383,7 +383,7 @@ public class ReplayMiddlewareTests
             return eq < 0 ? (Key: part, Value: string.Empty) : (Key: part[..eq], Value: part[(eq + 1)..]);
         }).ToDictionary(p => p.Key, p => p.Value);
 
-        Assert.Equal("hmac-sha256-v1", fields["scheme"]);
+        Assert.Equal("hmac-sha256-v2", fields["scheme"]);
         var livePaths = fields["live"].Split(',');
         Assert.Equal(["$.token"], livePaths);
 
@@ -403,7 +403,7 @@ public class ReplayMiddlewareTests
         Assert.True(response.Headers.TryGetValues(ReplayProtocol.MaskedResponseHeaderName, out var values));
         var headerValue = Assert.Single(values!);
 
-        Assert.Matches(@"^v1;scheme=hmac-sha256-v1;keyVersion=\d+$", headerValue);
+        Assert.Matches(@"^v1;scheme=hmac-sha256-v2;keyVersion=\d+$", headerValue);
     }
 
     private static string ExtractJsonStringField(string json, string fieldName)

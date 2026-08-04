@@ -9,7 +9,7 @@ namespace Jakapil.Capture.Replay;
 /// not verify, behavior is IDENTICAL to today: no masking, no capture suppression, no error (INV-B3).
 /// </summary>
 /// <remarks>
-/// This is the ADR's "ortam bazlı açma/kapama" (per-environment on/off) knob: leave <see cref="PublicKeys"/>
+/// This is the ADR's per-environment on/off knob: leave <see cref="PublicKeys"/>
 /// empty (the default) in any environment the Runner never targets, and replay verification is a guaranteed,
 /// zero-cost no-op — a request without the header never even reaches the parsing/crypto code path.
 /// </remarks>
@@ -88,7 +88,7 @@ internal static class ReplayVerificationOptionsValidator
 {
     /// <summary>Appends any validation failures for <paramref name="options"/> to <paramref name="failures"/>.
     /// Every configured public key is parsed here too — a malformed key fails FAST at host startup rather than
-    /// silently never verifying anything at runtime (the "uyarı = hata" build discipline applied to config).</summary>
+    /// silently never verifying anything at runtime (the warnings-as-errors build discipline applied to config).</summary>
     public static void Validate(ReplayVerificationOptions options, List<string> failures)
     {
         if (options.ClockSkewTolerance < TimeSpan.Zero)

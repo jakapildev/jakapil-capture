@@ -127,8 +127,45 @@ public readonly record struct ReplayHeaderDecision(string Value, bool PassedLive
 public sealed class Anonymizer : IAnonymizer
 {
     /// <summary>The anonymization scheme identifier written into <see cref="CapturedInteraction.Anon"/> and
-    /// exposed publicly via <see cref="Scheme"/>.</summary>
-    private const string SchemeId = "hmac-sha256-v1";
+    /// exposed publicly via <see cref="Scheme"/>. Bumped v1 -> v2 (GIZLILIK-1/G1) when the scope of what
+    /// <see cref="Anonymize"/> covers grew to include <see cref="CapturedInteraction.Identity"/>/
+    /// <see cref="CapturedInteraction.Correlation"/>/<see cref="CapturedInteraction.Auth"/> — the collector
+    /// treats this value opaquely (no comparison against it today), so the bump is purely declarative: it is
+    /// the only way to tell the cloud side "this payload's identity fields are covered too", not a
+    /// wire-breaking change.</summary>
+    private const string SchemeId = "hmac-sha256-v2";
+
+    /// <summary>ADR-0002 §5's "known field rules" analog for the three identity/correlation/auth-binding
+    /// subject copies (GIZLILIK-1/G1 decision table): the SAME semantic kind, used for all three, is what
+    /// guarantees <see cref="ComputeSubjectFingerprint"/> derives an IDENTICAL digest for the same raw value —
+    /// the HMAC in <see cref="FingerprintGenerator.ComputeCorrelationDigest"/> is a pure function of
+    /// (key, scope, semanticKind, rawValue), so no explicit cross-field caching is needed, only this shared
+    /// constant.</summary>
+    private const string SubjectSemanticKind = "subject";
+
+    /// <summary>Distinct domain from <see cref="SubjectSemanticKind"/> — a user name is a different business
+    /// value than the subject id and must not collide with it even if the two strings happened to be equal.</summary>
+    private const string UserNameSemanticKind = "username";
+
+    /// <summary>Uniform bucket for every <see cref="IdentityInfo.Claims"/> entry that is not a role claim
+    /// (fail-closed default — GIZLILIK-1/G1 decision table). Deliberately a single constant regardless of the
+    /// claim's own type, rather than deriving the semantic kind from the claim type: the claim TYPE string is
+    /// customer-controlled and unbounded (a custom claim URI could itself be identifying), and the semanticKind
+    /// travels in the envelope IN PLAINTEXT (see <see cref="ValueEnvelopeWriter.WriteFingerprint"/>) — using the
+    /// claim type there would leak it.</summary>
+    private const string ClaimSemanticKind = "claim";
+
+    private const string SessionCookieSemanticKind = "sessioncookie";
+    private const string ClientConnectionSemanticKind = "clientconnection";
+    private const string CorrelationHeaderSemanticKind = "correlationheader";
+
+    /// <summary>The two claim-type spellings that mean "role" (GIZLILIK-1/G1 decision table): the short form
+    /// common with JWT/System.IdentityModel claims, and the ASP.NET Core <c>ClaimTypes.Role</c> URI. Matched by
+    /// exact, case-SENSITIVE (ordinal) equality only — fail-closed: a claim type that merely differs in case, or
+    /// is otherwise unrecognized, must default to fingerprinting, never to an accidental plaintext leak.</summary>
+    private const string RoleClaimType = "role";
+
+    private const string RoleClaimTypeUri = "http://schemas.microsoft.com/ws/2008/06/identity/claims/role";
 
     private readonly byte[]? _key;
     private readonly int _keyVersion;
@@ -224,8 +261,122 @@ public sealed class Anonymizer : IAnonymizer
         {
             Request = request,
             Response = response,
+            Identity = TransformIdentity(interaction.Identity),
+            Correlation = TransformCorrelation(interaction.Correlation),
+            Auth = TransformAuthBinding(interaction.Auth),
             Anon = new AnonymizationInfo { Scheme = SchemeId, KeyVersion = _keyVersion },
         };
+    }
+
+    /// <summary>
+    /// GIZLILIK-1/G1: <see cref="IdentityInfo.SubjectId"/>/<see cref="IdentityInfo.UserName"/> and every
+    /// non-role <see cref="IdentityInfo.Claims"/> entry are fingerprinted; <see cref="IdentityInfo.IsAuthenticated"/>
+    /// and <see cref="IdentityInfo.AuthenticationScheme"/> stay plaintext (low-cardinality, not identifying on
+    /// their own). Null passes through untouched — there is nothing to anonymize on an unauthenticated request.
+    /// </summary>
+    private IdentityInfo? TransformIdentity(IdentityInfo? identity)
+    {
+        if (identity is null)
+        {
+            return identity;
+        }
+
+        return identity with
+        {
+            SubjectId = ComputeSubjectFingerprint(identity.SubjectId),
+            UserName = FingerprintValue(UserNameSemanticKind, identity.UserName),
+            Claims = TransformClaims(identity.Claims),
+        };
+    }
+
+    /// <summary>Role claims (see <see cref="RoleClaimType"/>/<see cref="RoleClaimTypeUri"/>) pass through
+    /// verbatim — everything else, INCLUDING claim types this SDK does not recognize, is fingerprinted
+    /// (fail-closed default, GIZLILIK-1/G1 decision table).</summary>
+    private IReadOnlyDictionary<string, string> TransformClaims(IReadOnlyDictionary<string, string> claims)
+    {
+        if (claims.Count == 0)
+        {
+            return claims;
+        }
+
+        var result = new Dictionary<string, string>(claims.Count, StringComparer.Ordinal);
+        foreach (var (claimType, value) in claims)
+        {
+            // Claims dictionary values are non-nullable `string`; FingerprintValue's return is annotated
+            // nullable only because it also accepts/passes through a null/empty INPUT unchanged — for a
+            // non-null `value` here it always returns a non-null result (either the fingerprint envelope, or
+            // `value` itself unchanged when empty), so the null-forgiving operator is sound, not a suppression.
+            result[claimType] = IsRoleClaimType(claimType) ? value : FingerprintValue(ClaimSemanticKind, value)!;
+        }
+
+        return result;
+    }
+
+    private static bool IsRoleClaimType(string claimType) =>
+        string.Equals(claimType, RoleClaimType, StringComparison.Ordinal) ||
+        string.Equals(claimType, RoleClaimTypeUri, StringComparison.Ordinal);
+
+    /// <summary>
+    /// GIZLILIK-1/G1: <see cref="CorrelationSignals.SubjectId"/> is fingerprinted with the SAME semantic kind as
+    /// <see cref="IdentityInfo.SubjectId"/>/<see cref="AuthBinding.SubjectId"/> (see
+    /// <see cref="ComputeSubjectFingerprint"/>), so the correlation edge between the three copies survives
+    /// anonymization. <see cref="CorrelationSignals.SessionCookieId"/>/<see cref="CorrelationSignals.ClientConnectionId"/>/
+    /// <see cref="CorrelationSignals.CustomCorrelationHeader"/> each get their OWN semantic-kind domain — distinct
+    /// from "subject" and from each other — so a coincidental string collision across these different signal
+    /// kinds can never produce a matching digest. <see cref="CorrelationSignals.TraceId"/>/<see cref="CorrelationSignals.SpanId"/>/
+    /// <see cref="CorrelationSignals.ParentSpanId"/>/<see cref="CorrelationSignals.ObservedAt"/> stay plaintext —
+    /// W3C trace identifiers are per-request-random, not user data.
+    /// </summary>
+    private CorrelationSignals TransformCorrelation(CorrelationSignals correlation) =>
+        correlation with
+        {
+            SubjectId = ComputeSubjectFingerprint(correlation.SubjectId),
+            SessionCookieId = FingerprintValue(SessionCookieSemanticKind, correlation.SessionCookieId),
+            ClientConnectionId = FingerprintValue(ClientConnectionSemanticKind, correlation.ClientConnectionId),
+            CustomCorrelationHeader = FingerprintValue(CorrelationHeaderSemanticKind, correlation.CustomCorrelationHeader),
+        };
+
+    /// <summary>GIZLILIK-1/G1: <see cref="AuthBinding.SubjectId"/> is fingerprinted with the SAME semantic kind
+    /// as <see cref="IdentityInfo.SubjectId"/>/<see cref="CorrelationSignals.SubjectId"/> (see
+    /// <see cref="ComputeSubjectFingerprint"/>). <see cref="AuthBinding.SourceInteractionId"/>/
+    /// <see cref="AuthBinding.SourceFieldPath"/> are values this SDK itself produced (an in-memory interaction
+    /// id and a JSONPath), not customer data, so they stay plaintext; <see cref="AuthBinding.AuthBearing"/>/
+    /// <see cref="AuthBinding.Scheme"/> are likewise low-cardinality metadata, not identifying.</summary>
+    private AuthBinding? TransformAuthBinding(AuthBinding? auth)
+    {
+        if (auth is null)
+        {
+            return auth;
+        }
+
+        return auth with { SubjectId = ComputeSubjectFingerprint(auth.SubjectId) };
+    }
+
+    /// <summary>
+    /// The single call site all three subject copies (<see cref="IdentityInfo.SubjectId"/>,
+    /// <see cref="CorrelationSignals.SubjectId"/>, <see cref="AuthBinding.SubjectId"/>) route through, so the
+    /// "same digest for the same raw value" guarantee is structural — one shared <see cref="SubjectSemanticKind"/>
+    /// constant plus <see cref="FingerprintGenerator.ComputeCorrelationDigest"/>'s determinism (it is a pure
+    /// function of key/scope/semanticKind/rawValue) means identical input ALWAYS produces an identical digest,
+    /// with no cross-field cache to keep in sync.
+    /// </summary>
+    private string? ComputeSubjectFingerprint(string? subjectId) => FingerprintValue(SubjectSemanticKind, subjectId);
+
+    /// <summary>Fingerprints a plain identity/correlation-signal string value — distinct from
+    /// <see cref="TransformTransportValue"/> (route/query/header) because these fields have a FIXED disposition
+    /// per the GIZLILIK-1/G1 decision table, not one derived from <see cref="FieldClassifier.Classify"/>'s
+    /// name-based heuristics. Null/empty pass through untouched (nothing to fingerprint). Always writes jsonType
+    /// <c>u</c> — like route/query/header values, these are plain transport-shaped text, never a JSON body leaf.</summary>
+    private string? FingerprintValue(string semanticKind, string? rawValue)
+    {
+        if (string.IsNullOrEmpty(rawValue))
+        {
+            return rawValue;
+        }
+
+        var digest = FingerprintGenerator.ComputeCorrelationDigest(
+            _key!, _scope.TenantId, _scope.ProjectId, _scope.Environment, semanticKind, rawValue);
+        return ValueEnvelopeWriter.WriteFingerprint("u", semanticKind, _keyVersion, digest);
     }
 
     private IReadOnlyList<RouteParameter> TransformRouteParameters(
@@ -335,7 +486,11 @@ public sealed class Anonymizer : IAnonymizer
     /// <see cref="FieldClass.SyntheticPii"/>, the raw text's numeric/boolean SHAPE (detected here, independent
     /// of classification — see <see cref="SyntheticPiiGenerator.DetectTransportShape"/>) is preserved in the
     /// replacement, so e.g. a numeric <c>PageSize</c> query value stays numeric TEXT and still parses on
-    /// replay (Defect 1) instead of becoming an alphanumeric token that fails the target's model binding.</summary>
+    /// replay (Defect 1) instead of becoming an alphanumeric token that fails the target's model binding.
+    /// v1.3.1 (GIZLILIK-2/G-1-1): before falling back to <see cref="FieldClassifier.Classify"/> at all, a
+    /// pagination/counter name (<see cref="IsTransportCounterSafeLiteral"/>) is resolved straight to
+    /// <see cref="FieldClass.SafeLiteral"/> — see that method's remarks for the shape gate and
+    /// <see cref="AnonymizationOptions.FieldPolicy"/> veto that bound it.</summary>
     private string TransformTransportValue(string fieldName, string rawValue)
     {
         if (string.IsNullOrEmpty(rawValue))
@@ -343,9 +498,45 @@ public sealed class Anonymizer : IAnonymizer
             return rawValue;
         }
 
-        var fieldClass = FieldClassifier.Classify(fieldName, LeafValueKind.String, rawValue, _fieldPolicy);
         var shape = SyntheticPiiGenerator.DetectTransportShape(rawValue);
+        var fieldClass = IsTransportCounterSafeLiteral(fieldName, shape)
+            ? FieldClass.SafeLiteral
+            : FieldClassifier.Classify(fieldName, LeafValueKind.String, rawValue, _fieldPolicy);
         return ApplyClass(fieldClass, fieldName, "u", rawValue, shape, isReplayMasking: false).Text;
+    }
+
+    /// <summary>
+    /// GIZLILIK-2/G-1-1 (v1.3.1): true when <paramref name="fieldName"/> is a recognized pagination/counter
+    /// name (<see cref="FieldNameRules.TransportCounterFieldNames"/>) AND <paramref name="shape"/> confirms the
+    /// raw value actually looks numeric. Fixes a defect where <c>?PageSize=10&amp;PageIndex=0</c> anonymized
+    /// into a different, unrelated number (neither name was in <see cref="FieldNameRules.SafeLiteralFieldNames"/>,
+    /// so both fell to the INV-A3 unknown-field fail-safe), silently corrupting the request's meaning.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Shape gate (mandatory).</b> Only <see cref="SyntheticValueShape.Integer"/>/
+    /// <see cref="SyntheticValueShape.Decimal"/> take this exception — a name match against a non-numeric value
+    /// (e.g. <c>?pageSize=ahmet@x.com</c>) falls through to ordinary classification instead, so a name/value
+    /// mismatch can never leak free text via this path. No digit-count limit is applied on top of the shape
+    /// check — a legitimate <c>offset=1000000</c> must still pass unchanged.</para>
+    /// <para><b><see cref="AnonymizationOptions.FieldPolicy"/> always wins.</b> Checked here directly — the same
+    /// pattern <see cref="TryReplayRunCredentialPassthrough"/> already uses — because this exception runs BEFORE
+    /// <see cref="FieldClassifier.Classify"/> is ever called, so that method's own step-1 policy check never
+    /// gets a chance to veto it otherwise.</para>
+    /// </remarks>
+    private bool IsTransportCounterSafeLiteral(string fieldName, SyntheticValueShape shape)
+    {
+        if (shape is not (SyntheticValueShape.Integer or SyntheticValueShape.Decimal))
+        {
+            return false;
+        }
+
+        if (_fieldPolicy.ContainsKey(fieldName))
+        {
+            return false;
+        }
+
+        var normalized = FieldNameRules.Normalize(fieldName);
+        return normalized.Length > 0 && FieldNameRules.TransportCounterFieldNames.Contains(normalized);
     }
 
     /// <summary>The final transformed text for one leaf (<see cref="Text"/>), plus whether it is still valid,

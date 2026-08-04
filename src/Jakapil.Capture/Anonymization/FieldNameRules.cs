@@ -191,6 +191,38 @@ internal static class FieldNameRules
         "status", "currency", "type", "quantity", "page", "limit",
     };
 
+    /// <summary>
+    /// GIZLILIK-2/G-1-1 (v1.3.1): pagination/counter names that are <see cref="FieldClass.SafeLiteral"/> ONLY
+    /// in a TRANSPORT position (a route/query/header value — see
+    /// <see cref="Anonymizer.TransformTransportValue"/>'s consumption of this set), never in a JSON body.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The bug this fixes:</b> a request's <c>?PageSize=10&amp;PageIndex=0</c> anonymized to something
+    /// like <c>?PageSize=35&amp;PageIndex=1</c> — a different, unrelated number — because neither name is in
+    /// <see cref="SafeLiteralFieldNames"/> (only <c>page</c>/<c>limit</c> are), so both fell to the INV-A3
+    /// unknown-field fail-safe (<see cref="FieldClass.SyntheticPii"/>, type-preserving since v1.2.0 but still a
+    /// DIFFERENT number). Corrupting a pagination parameter's value changes the request's meaning, not just its
+    /// identity, so the resulting scenario keeps asserting against the wrong page forever.</para>
+    /// <para><b>Deliberately NOT merged into <see cref="SafeLiteralFieldNames"/>:</b> that set is consulted by
+    /// <see cref="FieldClassifier.Classify"/>, which has no notion of "transport vs JSON body" — merging would
+    /// also make a body leaf like <c>{"pageSize": "10"}</c> SafeLiteral, which is out of scope here (no reported
+    /// defect for the body position, and body free-text fields like <c>note</c>/<c>description</c> must keep
+    /// synthesizing regardless of what a sibling counter field is named). <see cref="Anonymizer.TransformTransportValue"/>
+    /// consumes this set directly, gated by <see cref="SyntheticPiiGenerator.DetectTransportShape"/> resolving to
+    /// Integer/Decimal — a name match against a non-numeric value (e.g. <c>?pageSize=ahmet@x.com</c>) does NOT
+    /// take the exception, so a name/value mismatch can never leak free text through this path. No digit-count
+    /// limit is applied — a legitimate <c>offset=1000000</c> must still pass unchanged.</para>
+    /// <para><b>Deliberately excludes <c>sort</c>/<c>order</c>/<c>orderBy</c>/<c>direction</c>/<c>asc</c>/<c>desc</c>:</b>
+    /// no concrete failure has been reported for these, and <c>order</c> in particular can hold a business
+    /// reference (e.g. <c>"ORD-2024-000123"</c>) rather than a sort direction — widening this set to cover them
+    /// is deliberately deferred until a real case justifies it (same "extend only with a concrete, documented
+    /// case" discipline as <see cref="ContextSensitiveFieldNames"/>).</para>
+    /// </remarks>
+    public static readonly HashSet<string> TransportCounterFieldNames = new(StringComparer.Ordinal)
+    {
+        "pagesize", "pageindex", "pagenumber", "perpage", "offset", "skip", "take", "top",
+    };
+
     /// <summary>The three semantic roles ADR §6.1/§9 recognizes for flow identifiers.</summary>
     private static readonly HashSet<string> IdentifierRoleWords = new(StringComparer.Ordinal) { "id", "ref", "key" };
 

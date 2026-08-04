@@ -133,9 +133,8 @@ public sealed class ReplayVerifier : IReplayVerifier
             return Reject("unknown-kid");
         }
 
-        // ADR-0003 §6.3: "başka bir kiracının/ortamın geçerli imzası bu hedefte koşum muamelesi göremez" — a
-        // signature that is cryptographically valid for a DIFFERENT tenant/environment must not activate replay
-        // behavior here. Each check is INDEPENDENTLY optional (ReplayVerificationOptions.ExpectedTenantId /
+        // ADR-0003 §6.3: a signature that is cryptographically valid for a DIFFERENT tenant/environment must
+        // not be treated as a valid replay run here. Each check is INDEPENDENTLY optional (ReplayVerificationOptions.ExpectedTenantId /
         // ExpectedEnvironmentId — deliberately NOT AnonymizationOptions.Scope, which feeds HMAC domain
         // separation and must not be repurposed): when a value is configured, the header MUST match it; when
         // it is left unconfigured, that particular check is skipped rather than always-mismatching. See

@@ -69,6 +69,37 @@ value (name, email, password, flow identifier, ...) is ever sent to the collecto
 `FlowFingerprint`, `SyntheticPii`, `SecretTombstone`) and `AnonymizationOptions.FieldPolicy` for the
 customer override that always wins over the built-in rules below.
 
+### Identity, correlation, and auth-binding fields are anonymized too
+
+Earlier releases of this SDK only ran the classifier above over the `Request`/`Response` body,
+route/query parameters, and the allowlisted headers. The identity and correlation data every
+captured interaction also carries — `Identity` (`SubjectId`, `UserName`, every claim), `Correlation`
+(`SubjectId`, `SessionCookieId`, `ClientConnectionId`, `CustomCorrelationHeader`), and
+`AuthBinding.SubjectId` — passed through untouched. With a key configured, a JWT `sub`, a username,
+and every claim your identity provider issues went to the collector as plaintext even though the
+request/response body was fully anonymized alongside it.
+
+`Anonymizer.Anonymize` now covers those three blocks too, using the exact same one-way HMAC
+fingerprint as the rest of this SDK — same key, same `Scope`. The three copies of a subject id that
+appear across `Identity`, `Correlation`, and `AuthBinding` are guaranteed to fingerprint to the
+**identical** value, so correlating a user across all three survives anonymization. The scheme
+identifier reported in `CapturedInteraction.Anon` changed to reflect the wider coverage — this is a
+purely declarative marker (the collector never compares it against anything) whose only purpose is
+telling the cloud side "this payload's identity fields are covered too".
+
+**Role claims are the one deliberate exception** — a claim named `role`, or the ASP.NET Core role
+claim URI, is still sent as plaintext. A role (`Administrators`, `Support`) is an authorization
+category, not something that identifies a person, and the set of roles in a typical application is
+small enough that a fingerprint over it would be reversible by dictionary attack anyway — hiding it
+buys little privacy while destroying a signal a role-aware test-user matching feature would need
+down the line. Every other claim your identity provider issues — including ones this SDK doesn't
+recognize — is fingerprinted; an unrecognized claim type is treated as potentially identifying, never
+assumed safe.
+
+As before, with no anonymization key configured, none of this runs: the whole interaction — body,
+route/query, and now these identity/correlation fields too — passes through unchanged, and you still
+get the startup warning about running in pass-through mode.
+
 ### Generic `name` is context-sensitive (since v1.2.0)
 
 Strong-signal person-name fields (`fullName`, `firstName`, `lastName`, `surname`, ...) are **always**
@@ -115,7 +146,7 @@ by this guarantee — an unrecognized field still fails safe to `SyntheticPii` e
 only the **shape** of the replacement value changes to match what it is standing in for. Two concrete
 consequences:
 
-- A numeric field with no recognized name (e.g. `PageSize`/`PageIndex` query parameters) used to
+- A numeric field with no recognized name (e.g. a custom `batchCount` query parameter) used to
   synthesize to alphanumeric text (`synthetic-77598c5712fd`), which many APIs' model binders reject
   outright (`400 Bad Request`) — breaking replay while still hiding nothing useful. It now synthesizes to
   numeric text instead (still non-reversible and non-correlatable outside its key/scope), so the request
@@ -133,9 +164,52 @@ envelopes are written for a JSON body leaf — those remain textual by design, a
 itself already records the original JSON type as an embedded tag (`fp:n:...`, `jkp:tomb:n:...`) for the
 server side to use. The one passthrough exception is described next.
 
+### Pagination/counter query, route, and header values pass through unchanged (since v1.3.1)
+
+`page` and `limit` have always been `SafeLiteral` (see the built-in allowlist above), but a request like
+`GET /api/catalog-items?PageSize=10&PageIndex=0` used to have its `PageSize`/`PageIndex` values
+anonymized into a **different** number (e.g. `?PageSize=35&PageIndex=1`) — neither name was recognized,
+so both fell to the unknown-field fail-safe (`SyntheticPii`). Type-preservation (above) kept the
+replacement numeric so the target's model binder still accepted it, but the *value itself* changed,
+which silently corrupts the request's meaning: a scenario built from that capture keeps asking for page
+35 instead of page 0/10, and a size-dependent assertion (e.g. "response has 10 items") fails forever
+against a live re-run, even though nothing about the target actually broke.
+
+As of v1.3.1, these English pagination/counter names are recognized as `SafeLiteral` **only when they
+appear as a route, query-string, or header value** — never in a JSON body — and only when the raw text
+still looks like the number it claims to be:
+
+`pageSize`, `pageIndex`, `pageNumber`, `perPage`, `offset`, `skip`, `take`, `top` (plus the
+pre-existing `page`/`limit`) — matched case-insensitively and independent of separators, so
+`page_size`, `page[size]`, `$top`, and `_limit` all resolve to the same recognized name.
+
+Two things deliberately still apply on top of a name match:
+
+- **Shape gate.** The value must actually look numeric (`SyntheticPiiGenerator.DetectTransportShape`). A
+  name/value mismatch — e.g. `?pageSize=ahmet@x.com` — does **not** take this exception and is
+  anonymized exactly as before, so a field merely *named* like a counter can never leak free text this
+  way. There is no upper bound on digit count — a legitimate `offset=1000000` still passes unchanged.
+- **`FieldPolicy` always wins.** An explicit `AnonymizationOptions.FieldPolicy["pageSize"] = ...` entry
+  overrides this default exactly like every other built-in rule.
+
+**Non-English pagination names are not covered.** A parameter named `sayfaBoyutu` or `kayitSayisi`
+normalizes to a token this list does not contain, so it still falls to the unknown-field fail-safe
+(shape-preserved synthesis, not plaintext passthrough). If your API uses non-English (or otherwise
+unlisted) pagination/counter names and you want them to pass through unchanged too, the escape hatch is
+the same `FieldPolicy` override:
+
+```csharp
+options.Anonymization.FieldPolicy["sayfaBoyutu"] = FieldClass.SafeLiteral;
+```
+
+Also deliberately **not** included: `sort`, `order`, `orderBy`, `direction`, `asc`, `desc`. No concrete
+failure has been reported for these, and `order` in particular can hold a business reference (e.g.
+`"ORD-2024-000123"`) rather than a sort direction in some APIs — widen this list only for a documented
+case, via `FieldPolicy`, not speculatively.
+
 ## Signed replay-request verification (since v1.2.0)
 
-When the Jakapil Runner re-runs a scenario against your API (a "koşum"), it can attach a cryptographically
+When the Jakapil Runner re-runs a scenario against your API (a test run), it can attach a cryptographically
 signed `X-Jakapil-Replay` header to each request. When this SDK verifies that signature, two things happen to
 that request that never happen for ordinary traffic:
 
