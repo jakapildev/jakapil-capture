@@ -250,7 +250,7 @@ public class ReplayMaskedHeaderMatrixTests
 
         var headerValue = MaskedHeaderValue(response);
         Assert.NotNull(headerValue);
-        Assert.StartsWith("v1;scheme=hmac-sha256-v1;keyVersion=", headerValue);
+        Assert.StartsWith("v1;scheme=hmac-sha256-v2;keyVersion=", headerValue);
         Assert.DoesNotContain(";body=", headerValue);
     }
 
@@ -277,7 +277,7 @@ public class ReplayMaskedHeaderMatrixTests
 
         var headerValue = MaskedHeaderValue(response);
         Assert.NotNull(headerValue);
-        Assert.StartsWith($"v1;scheme=hmac-sha256-v1;keyVersion=", headerValue);
+        Assert.StartsWith($"v1;scheme=hmac-sha256-v2;keyVersion=", headerValue);
         Assert.Contains($";body={ReplayProtocol.UnmaskedNonJsonBodyDisposition}", headerValue);
 
         var bodyBytes = await response.Content.ReadAsByteArrayAsync();

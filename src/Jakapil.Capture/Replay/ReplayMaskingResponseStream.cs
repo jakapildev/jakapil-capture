@@ -10,7 +10,7 @@ namespace Jakapil.Capture.Replay;
 /// real stream immediately, for zero-latency production capture): a replay response must be MASKED before any
 /// byte reaches the caller, so the real bytes cannot be released until the complete body is known and has been
 /// transformed. This is safe specifically because signed-replay traffic only ever originates from the Jakapil
-/// Runner running a test/koşum scenario against a non-production target (ADR-0003 §8.5) — it is not
+/// Runner running a test scenario against a non-production target (ADR-0003 §8.5) — it is not
 /// production load, so holding the full response in memory for the duration of one request is an acceptable
 /// trade for the ability to rewrite it.
 /// <para>
