@@ -133,6 +133,67 @@ public sealed class CaptureBuilderTests
         Assert.Equal("Administrators", interaction.Identity.Claims[ClaimTypes.Role]);
     }
 
+    /// <summary>Regression test for defect K-3: a principal carrying several claims of the SAME type (the
+    /// normal shape for a multi-role user — two separate <c>role</c> claims) must have every value preserved
+    /// in <see cref="IdentityInfo.MultiValuedClaims"/>, in encounter order. <see cref="IdentityInfo.Claims"/>
+    /// keeps its pre-existing last-writer-wins behavior unchanged, so older server versions that only read
+    /// <see cref="IdentityInfo.Claims"/> keep working.</summary>
+    [Fact]
+    public void Build_MultipleClaimsOfSameType_PreservesAllValuesInMultiValuedClaims_ClaimsKeepsLastWriterWins()
+    {
+        var identity = new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.NameIdentifier, "multi-role-subject"),
+                new Claim(ClaimTypes.Role, "Admin"),
+                new Claim(ClaimTypes.Role, "Auditor"),
+            ],
+            authenticationType: "Bearer");
+
+        var context = new DefaultHttpContext { User = new ClaimsPrincipal(identity) };
+
+        var interaction = CaptureBuilder.Build(
+            context,
+            DateTimeOffset.UtcNow,
+            durationMs: 1,
+            requestBody: null,
+            responseBody: null,
+            exception: null,
+            options: new JakapilCaptureOptions());
+
+        Assert.NotNull(interaction.Identity);
+        Assert.Equal("Auditor", interaction.Identity!.Claims[ClaimTypes.Role]);
+        Assert.NotNull(interaction.Identity.MultiValuedClaims);
+        Assert.Equal(["Admin", "Auditor"], interaction.Identity.MultiValuedClaims![ClaimTypes.Role]);
+    }
+
+    /// <summary>Hot-path guarantee: when no claim type on the principal has more than one value,
+    /// <see cref="IdentityInfo.MultiValuedClaims"/> stays null — the common single-valued case must not
+    /// allocate an always-empty map.</summary>
+    [Fact]
+    public void Build_NoDuplicateClaimTypes_MultiValuedClaimsIsNull()
+    {
+        var identity = new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.NameIdentifier, "solo-subject"),
+                new Claim(ClaimTypes.Role, "Admin"),
+            ],
+            authenticationType: "Bearer");
+
+        var context = new DefaultHttpContext { User = new ClaimsPrincipal(identity) };
+
+        var interaction = CaptureBuilder.Build(
+            context,
+            DateTimeOffset.UtcNow,
+            durationMs: 1,
+            requestBody: null,
+            responseBody: null,
+            exception: null,
+            options: new JakapilCaptureOptions());
+
+        Assert.NotNull(interaction.Identity);
+        Assert.Null(interaction.Identity!.MultiValuedClaims);
+    }
+
     /// <summary>Regression guard: a single-identity principal must behave exactly as before the K-1 fix.</summary>
     [Fact]
     public void Build_SingleIdentity_ReadsSchemeUserNameAndSubjectAsBefore()

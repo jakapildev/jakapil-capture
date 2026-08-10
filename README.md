@@ -87,6 +87,12 @@ package.
 principal, so a role claim relevant to matching is never lost even when it lives on an identity other
 than the one selected as authoritative.
 
+**Multi-valued claims.** `IdentityInfo.Claims` holds one value per claim type, so a principal with
+several claims of the same type — the normal shape for a multi-role user, e.g. two separate `role`
+claims — only keeps the last one there. `IdentityInfo.MultiValuedClaims` carries the full set of
+values for every claim type that has more than one, in encounter order; it is `null` when no claim
+type is duplicated, so the common single-valued case reads `Claims` as before and pays no extra cost.
+
 ## Field anonymization
 
 When `AnonymizationOptions` is configured with a key (`JAKAPIL_ANON_KEY` by default), every captured
@@ -121,7 +127,9 @@ small enough that a fingerprint over it would be reversible by dictionary attack
 buys little privacy while destroying a signal a role-aware test-user matching feature would need
 down the line. Every other claim your identity provider issues — including ones this SDK doesn't
 recognize — is fingerprinted; an unrecognized claim type is treated as potentially identifying, never
-assumed safe.
+assumed safe. `IdentityInfo.MultiValuedClaims` (a multi-role user's extra `role` values, or any other
+claim type repeated more than once) goes through the exact same rule: role values stay plaintext,
+everything else is fingerprinted with the same key and scope as its `Claims` counterpart.
 
 As before, with no anonymization key configured, none of this runs: the whole interaction — body,
 route/query, and now these identity/correlation fields too — passes through unchanged, and you still

@@ -907,6 +907,92 @@ public sealed class AnonymizerTests
         Assert.Equal("admin", result.Identity!.Claims[roleClaimType]);
     }
 
+    // ---- defect K-3: MultiValuedClaims must go through the same anonymization rule set as Claims ------------
+
+    [Theory]
+    [InlineData("role")]
+    [InlineData("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")]
+    public void Anonymize_MultiValuedRoleClaim_BothTypeSpellings_PassThroughUnchanged(string roleClaimType)
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { [roleClaimType] = "Auditor" },
+            MultiValuedClaims = new Dictionary<string, IReadOnlyList<string>> { [roleClaimType] = ["Admin", "Auditor"] },
+        });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Equal(["Admin", "Auditor"], result.Identity!.MultiValuedClaims![roleClaimType]);
+    }
+
+    /// <summary>The important coverage case: with anonymization enabled, a non-role value reachable ONLY through
+    /// <see cref="IdentityInfo.MultiValuedClaims"/> (never through <see cref="IdentityInfo.Claims"/>, which for
+    /// this claim type holds a different, last-writer-wins value) must be fingerprinted — proven by asserting a
+    /// distinctive secret-looking value does not appear anywhere in the serialized interaction, not just in the
+    /// one field a narrower test would check.</summary>
+    [Fact]
+    public void Anonymize_MultiValuedClaims_NonRoleValues_AreFingerprinted_NeverLeakPlaintext()
+    {
+        const string secretDepartmentValue = "top-secret-skunkworks-division-x9f3";
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { ["department"] = "engineering" },
+            MultiValuedClaims = new Dictionary<string, IReadOnlyList<string>>
+            {
+                ["department"] = ["engineering", secretDepartmentValue],
+            },
+        });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        var transformedValues = result.Identity!.MultiValuedClaims!["department"];
+        Assert.All(transformedValues, v => Assert.StartsWith("fp:u:claim:", v));
+
+        var serialized = System.Text.Json.JsonSerializer.Serialize(result);
+        Assert.DoesNotContain(secretDepartmentValue, serialized);
+    }
+
+    /// <summary>Consistency guard: the same raw claim value must fingerprint to the SAME envelope whether it
+    /// arrives via <see cref="IdentityInfo.Claims"/> or <see cref="IdentityInfo.MultiValuedClaims"/> — both
+    /// route through the identical (semantic kind, key) pair, so a downstream consumer matching on the digest
+    /// sees no difference based on which field carried the value.</summary>
+    [Fact]
+    public void Anonymize_SameClaimValue_ViaClaimsOrMultiValuedClaims_ProducesIdenticalEnvelope()
+    {
+        const string value = "engineering";
+        var anonymizer = new Anonymizer(Key, Options, []);
+
+        var viaClaims = anonymizer.Anonymize(BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { ["department"] = value },
+        }));
+
+        var viaMultiValued = anonymizer.Anonymize(BuildInteraction(identity: new IdentityInfo
+        {
+            IsAuthenticated = true,
+            Claims = new Dictionary<string, string> { ["department"] = "other-current-value" },
+            MultiValuedClaims = new Dictionary<string, IReadOnlyList<string>> { ["department"] = [value, "other-current-value"] },
+        }));
+
+        Assert.Equal(viaClaims.Identity!.Claims["department"], viaMultiValued.Identity!.MultiValuedClaims!["department"][0]);
+    }
+
+    [Fact]
+    public void Anonymize_MultiValuedClaims_Null_PassesThroughUnchanged()
+    {
+        var anonymizer = new Anonymizer(Key, Options, []);
+        var interaction = BuildInteraction(identity: new IdentityInfo { IsAuthenticated = true });
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.Null(result.Identity!.MultiValuedClaims);
+    }
+
     [Fact]
     public void Anonymize_UnrecognizedClaimType_IsFingerprinted_FailClosed()
     {

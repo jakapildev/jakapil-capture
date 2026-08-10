@@ -133,7 +133,10 @@ public static class CaptureBuilder
     }
 
     /// <summary>Builds an <see cref="IdentityInfo"/> from a <see cref="ClaimsPrincipal"/> containing the authentication
-    /// status, scheme, subject id, user name, and claims; on duplicate claim types, last writer wins.</summary>
+    /// status, scheme, subject id, user name, and claims; on duplicate claim types, <see cref="IdentityInfo.Claims"/>
+    /// keeps the last value (legacy behavior), while every value is preserved in
+    /// <see cref="IdentityInfo.MultiValuedClaims"/> (defect K-3: a multi-role user's several <c>role</c> claims used
+    /// to collapse to one).</summary>
     /// <remarks>
     /// Returns null if there is no identity. <see cref="IdentityInfo.IsAuthenticated"/>,
     /// <see cref="IdentityInfo.AuthenticationScheme"/>, <see cref="IdentityInfo.UserName"/> and
@@ -141,7 +144,10 @@ public static class CaptureBuilder
     /// <see cref="SelectAuthoritativeIdentity"/>, so they describe the same identity. <see cref="IdentityInfo.Claims"/>
     /// is deliberately kept as the merged set across every identity on the principal: a role claim relevant to
     /// matching may live on a different identity than the one that authorised the request, so narrowing the claim
-    /// set to the selected identity would lose matching signal the fix is not meant to discard.
+    /// set to the selected identity would lose matching signal the fix is not meant to discard. The walk is a
+    /// single pass over <see cref="ClaimsPrincipal.Claims"/>: <c>duplicates</c> stays null and no extra list is
+    /// allocated for the common single-valued case; only when a claim TYPE is seen a second time does it start
+    /// tracking that type's values (seeding the list from the value already in <c>claims</c>).
     /// </remarks>
     private static IdentityInfo? BuildIdentity(ClaimsPrincipal? user)
     {
@@ -151,9 +157,31 @@ public static class CaptureBuilder
         }
 
         var claims = new Dictionary<string, string>();
+        Dictionary<string, List<string>>? duplicates = null;
         foreach (var claim in user.Claims)
         {
+            if (duplicates is not null && duplicates.TryGetValue(claim.Type, out var values))
+            {
+                values.Add(claim.Value);
+            }
+            else if (claims.ContainsKey(claim.Type))
+            {
+                (duplicates ??= [])[claim.Type] = [claims[claim.Type], claim.Value];
+            }
+
             claims[claim.Type] = claim.Value;
+        }
+
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? multiValuedClaims = null;
+        if (duplicates is not null)
+        {
+            var result = new Dictionary<string, IReadOnlyList<string>>(duplicates.Count);
+            foreach (var (claimType, values) in duplicates)
+            {
+                result[claimType] = values;
+            }
+
+            multiValuedClaims = result;
         }
 
         var identity = SelectAuthoritativeIdentity(user);
@@ -165,6 +193,7 @@ public static class CaptureBuilder
             SubjectId = identity is null ? null : FindSubjectId(identity),
             UserName = identity?.Name ?? user.Identity.Name,
             Claims = claims,
+            MultiValuedClaims = multiValuedClaims,
         };
     }
 

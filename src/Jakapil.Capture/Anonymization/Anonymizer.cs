@@ -286,6 +286,7 @@ public sealed class Anonymizer : IAnonymizer
             SubjectId = ComputeSubjectFingerprint(identity.SubjectId),
             UserName = FingerprintValue(UserNameSemanticKind, identity.UserName),
             Claims = TransformClaims(identity.Claims),
+            MultiValuedClaims = TransformMultiValuedClaims(identity.MultiValuedClaims),
         };
     }
 
@@ -307,6 +308,46 @@ public sealed class Anonymizer : IAnonymizer
             // non-null `value` here it always returns a non-null result (either the fingerprint envelope, or
             // `value` itself unchanged when empty), so the null-forgiving operator is sound, not a suppression.
             result[claimType] = IsRoleClaimType(claimType) ? value : FingerprintValue(ClaimSemanticKind, value)!;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Defect K-3 companion: <see cref="IdentityInfo.MultiValuedClaims"/> goes through the EXACT same rule set
+    /// as <see cref="TransformClaims"/> — same role-claim-type recognition (<see cref="IsRoleClaimType"/>, not a
+    /// second hardcoded list), same <see cref="ClaimSemanticKind"/> — so a value fingerprints identically
+    /// whether it arrives via <see cref="IdentityInfo.Claims"/> or here. Without this, a multi-role user's
+    /// second/third role claim would still pass through in <see cref="IdentityInfo.Claims"/> (by design), but a
+    /// non-role duplicate-typed claim's extra values would reach the collector in PLAINTEXT — the exact bug
+    /// class GIZLILIK-1 exists to close, reopened through this new field.
+    /// </summary>
+    private IReadOnlyDictionary<string, IReadOnlyList<string>>? TransformMultiValuedClaims(
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? multiValuedClaims)
+    {
+        if (multiValuedClaims is null || multiValuedClaims.Count == 0)
+        {
+            return multiValuedClaims;
+        }
+
+        var result = new Dictionary<string, IReadOnlyList<string>>(multiValuedClaims.Count, StringComparer.Ordinal);
+        foreach (var (claimType, values) in multiValuedClaims)
+        {
+            if (IsRoleClaimType(claimType))
+            {
+                result[claimType] = values;
+                continue;
+            }
+
+            var transformed = new List<string>(values.Count);
+            foreach (var value in values)
+            {
+                // Same null-forgiving reasoning as TransformClaims: every value here is a non-null claim
+                // value, so FingerprintValue always returns a non-null result for it.
+                transformed.Add(FingerprintValue(ClaimSemanticKind, value)!);
+            }
+
+            result[claimType] = transformed;
         }
 
         return result;
