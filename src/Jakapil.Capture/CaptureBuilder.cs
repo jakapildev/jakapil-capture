@@ -56,9 +56,8 @@ public static class CaptureBuilder
 
         var endpoint = reExecuted ? null : context.GetEndpoint();
         var id = Guid.NewGuid();
-        var subject = context.User?.Identity?.IsAuthenticated == true
-            ? (context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? context.User.FindFirst("sub")?.Value)
-            : null;
+        var authoritativeIdentity = SelectAuthoritativeIdentity(context.User);
+        var subject = authoritativeIdentity is { IsAuthenticated: true } ? FindSubjectId(authoritativeIdentity) : null;
 
         var auth = authTokens is null ? null : AuthFlowExtractor.ResolveAuthBinding(context, subject, authTokens);
         if (authTokens is not null)
@@ -135,7 +134,15 @@ public static class CaptureBuilder
 
     /// <summary>Builds an <see cref="IdentityInfo"/> from a <see cref="ClaimsPrincipal"/> containing the authentication
     /// status, scheme, subject id, user name, and claims; on duplicate claim types, last writer wins.</summary>
-    /// <remarks>Returns null if there is no identity.</remarks>
+    /// <remarks>
+    /// Returns null if there is no identity. <see cref="IdentityInfo.IsAuthenticated"/>,
+    /// <see cref="IdentityInfo.AuthenticationScheme"/>, <see cref="IdentityInfo.UserName"/> and
+    /// <see cref="IdentityInfo.SubjectId"/> are all read from the single identity selected by
+    /// <see cref="SelectAuthoritativeIdentity"/>, so they describe the same identity. <see cref="IdentityInfo.Claims"/>
+    /// is deliberately kept as the merged set across every identity on the principal: a role claim relevant to
+    /// matching may live on a different identity than the one that authorised the request, so narrowing the claim
+    /// set to the selected identity would lose matching signal the fix is not meant to discard.
+    /// </remarks>
     private static IdentityInfo? BuildIdentity(ClaimsPrincipal? user)
     {
         if (user?.Identity is null)
@@ -149,15 +156,39 @@ public static class CaptureBuilder
             claims[claim.Type] = claim.Value;
         }
 
+        var identity = SelectAuthoritativeIdentity(user);
+
         return new IdentityInfo
         {
-            IsAuthenticated = user.Identity.IsAuthenticated,
-            AuthenticationScheme = (user.Identity as ClaimsIdentity)?.AuthenticationType,
-            SubjectId = user.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? user.FindFirst("sub")?.Value,
-            UserName = user.Identity.Name,
+            IsAuthenticated = identity?.IsAuthenticated ?? user.Identity.IsAuthenticated,
+            AuthenticationScheme = identity?.AuthenticationType,
+            SubjectId = identity is null ? null : FindSubjectId(identity),
+            UserName = identity?.Name ?? user.Identity.Name,
             Claims = claims,
         };
     }
+
+    /// <summary>Selects the identity that authorised the request out of a (possibly multi-identity)
+    /// <see cref="ClaimsPrincipal"/>: the first identity for which <see cref="ClaimsIdentity.IsAuthenticated"/> is
+    /// true, falling back to the principal's primary identity (<see cref="ClaimsPrincipal.Identity"/>) if none is
+    /// authenticated.</summary>
+    /// <remarks>
+    /// A <see cref="ClaimsPrincipal"/> commonly carries more than one <see cref="ClaimsIdentity"/> — for example an
+    /// ASP.NET Core Identity cookie identity alongside a JWT bearer identity added by a second authentication
+    /// handler. <see cref="ClaimsPrincipal.Identity"/> only ever returns the <em>first</em> of these, which is not
+    /// necessarily the one that actually authorised the request; reading scheme/name from it while reading the
+    /// subject id from <c>principal.FindFirst</c> (which searches every identity) can silently mix fields from two
+    /// different identities. Selecting deterministically here — in exactly one place — is what makes
+    /// <see cref="IdentityInfo.AuthenticationScheme"/>, <see cref="IdentityInfo.UserName"/> and
+    /// <see cref="IdentityInfo.SubjectId"/> (and the request/correlation subject) describe the same identity.
+    /// </remarks>
+    private static ClaimsIdentity? SelectAuthoritativeIdentity(ClaimsPrincipal? user) =>
+        user is null ? null : user.Identities.FirstOrDefault(i => i.IsAuthenticated) ?? user.Identity as ClaimsIdentity;
+
+    /// <summary>Finds the subject id on a single identity: the <c>NameIdentifier</c> claim, falling back to
+    /// <c>sub</c> (the common claim name for JWTs that were not mapped onto <see cref="ClaimTypes"/>).</summary>
+    private static string? FindSubjectId(ClaimsIdentity identity) =>
+        identity.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? identity.FindFirst("sub")?.Value;
 
     /// <summary>Builds a <see cref="CapturedException"/> from an <see cref="Exception"/> containing the type name and message.</summary>
     private static CapturedException BuildException(Exception exception) => new()
@@ -183,9 +214,8 @@ public static class CaptureBuilder
             }
         }
 
-        var identitySubject = context.User?.Identity?.IsAuthenticated == true
-            ? (context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? context.User.FindFirst("sub")?.Value)
-            : null;
+        var correlationIdentity = SelectAuthoritativeIdentity(context.User);
+        var identitySubject = correlationIdentity is { IsAuthenticated: true } ? FindSubjectId(correlationIdentity) : null;
 
         return new CorrelationSignals
         {

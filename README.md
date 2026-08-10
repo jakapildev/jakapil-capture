@@ -60,6 +60,33 @@ Other settings (`MaxCapturedResponseBytes`, `StreamingContentTypes`, `QueueCapac
 `ExportFlushIntervalSeconds`) ship with sensible defaults; see the `JakapilCaptureOptions`
 XML documentation comments for details.
 
+## Identity capture from multi-identity principals
+
+`HttpContext.User` commonly carries more than one `ClaimsIdentity` — for example an ASP.NET Core
+Identity cookie identity alongside a JWT bearer identity added by a second authentication handler on
+the same request. `CaptureBuilder` selects exactly one identity as authoritative for
+`IdentityInfo.AuthenticationScheme`, `IdentityInfo.UserName`, and `IdentityInfo.SubjectId`: the first
+identity for which `ClaimsIdentity.IsAuthenticated` is true, falling back to the principal's primary
+identity (`ClaimsPrincipal.Identity`) when none is authenticated.
+
+**This is a documented limitation, not a claim that the first authenticated identity is the one that
+actually authorised the request.** `HttpContext` alone does not reveal which of several authenticated
+identities did, and inferring it from the raw `Authorization` header would couple identity capture to
+transport details this SDK deliberately avoids. What the selection guarantees is that the three
+fields above always describe the *same* identity, instead of being silently mixed across two.
+
+**Behavior change.** `SubjectId` used to be resolved with `principal.FindFirst(...)`, which searches
+every identity on the principal. It is now resolved only against the selected identity. If a
+principal's selected identity carries no `NameIdentifier`/`sub` claim while a *different* identity on
+the same principal does, `SubjectId` goes from populated to `null` compared to earlier versions. This
+is intentional — a subject id that belongs to a different identity than the reported scheme and user
+name is worse than no subject id at all — but it is an observable change for consumers upgrading the
+package.
+
+`IdentityInfo.Claims` is unaffected by the selection: it stays merged across every identity on the
+principal, so a role claim relevant to matching is never lost even when it lives on an identity other
+than the one selected as authoritative.
+
 ## Field anonymization
 
 When `AnonymizationOptions` is configured with a key (`JAKAPIL_ANON_KEY` by default), every captured

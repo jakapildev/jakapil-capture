@@ -42,9 +42,14 @@ internal static class AuthFlowExtractor
 
     /// <summary>Registers every token-role leaf in this response body so that a subsequent authenticated request
     /// can be bound to it.</summary>
-    /// <remarks>Only the hash is stored; the token value is discarded after being hashed. The response's own identity
-    /// (a user-id leaf) is taken as the subject the login/register resolves to; no token is registered for an
-    /// unparseable body.</remarks>
+    /// <remarks>
+    /// Only the hash is stored; the token value is discarded after being hashed. A minted token belongs to the
+    /// subject the response body names — not to whoever happened to be signed in (or not) when the login/register
+    /// call was made, e.g. a service account performing the login, or a previous session still active on the same
+    /// connection. So the response's own identity (a user-id leaf) is authoritative and takes precedence; the
+    /// caller's identity (<paramref name="subject"/>) is only a fallback for responses that carry no recognisable
+    /// subject field. No token is registered for an unparseable body.
+    /// </remarks>
     public static void RegisterEmittedTokens(Guid id, string? subject, CapturedBody? responseBody, IAuthTokenRegistry authTokens)
     {
         if (responseBody is not { Kind: BodyKind.Json, Truncated: false, Text: { Length: > 0 } text })
@@ -55,7 +60,7 @@ internal static class AuthFlowExtractor
         try
         {
             using var doc = JsonDocument.Parse(text);
-            var responseSubject = subject ?? ResponseSubject(doc.RootElement);
+            var responseSubject = ResponseSubject(doc.RootElement) ?? subject;
             WalkTokens(doc.RootElement, "$", id, responseSubject, authTokens);
         }
         catch (JsonException)
