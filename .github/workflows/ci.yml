@@ -1,0 +1,44 @@
+# Build and test gate for pull requests and main.
+#
+# Without this, nothing stops a red branch from reaching main, and the first thing that
+# would notice is the release workflow — after a tag has already been pushed. This runs
+# the same build and test commands the release does, just earlier and cheaper.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same branch makes the in-flight run obsolete.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      # TreatWarningsAsErrors is on: a warning is a failure here, which is the point.
+      # --no-incremental stops a stale obj/ from hiding one.
+      - name: Build
+        run: dotnet build -c Release --no-restore --no-incremental
+
+      # xUnit, no external dependencies — no database or Docker needed.
+      - name: Test
+        run: dotnet test -c Release --no-build --verbosity normal

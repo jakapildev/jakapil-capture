@@ -1,0 +1,105 @@
+# Publishes Jakapil.Capture and Jakapil.Capture.Contracts to nuget.org.
+#
+# Trigger: pushing a `v*` tag — NOT every merge to main. The package version lives in
+# Directory.Build.props, so a push-triggered workflow would keep re-publishing the same
+# version, and AGENTS.md forbids repacking a version with different content. Tagging is
+# already the deliberate "release this" act, so the publish gate belongs there.
+#
+# The tag must match the version in Directory.Build.props. That is checked explicitly
+# below and fails the run early, because the alternative failure — publishing 2.0.0
+# content under a v2.0.1 tag — is unfixable once it reaches nuget.org.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build, test and pack, but do not push to nuget.org'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # net10.0 builds the solution; net8.0 is the other target framework.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # The version is single-sourced in Directory.Build.props and shared by both
+      # packages. Read it here so the tag check and the push step agree on one value.
+      - name: Read the package version
+        id: version
+        run: |
+          version=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Directory.Build.props | head -n 1)
+          if [ -z "$version" ]; then
+            echo "Could not read <Version> from Directory.Build.props." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version"
+
+      # Only meaningful for tag pushes; a manual dispatch has no tag to compare against.
+      - name: Verify the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="${{ steps.version.outputs.version }}"
+          if [ "$tag" != "$version" ]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match <Version>$version</Version> in Directory.Build.props." >&2
+            echo "Bump the version and retag, or delete the tag — do not publish a mismatch." >&2
+            exit 1
+          fi
+          echo "Tag and package version agree: $version"
+
+      - name: Restore
+        run: dotnet restore
+
+      # TreatWarningsAsErrors is on, so a warning fails the release here rather than
+      # shipping. --no-incremental keeps a stale obj/ from hiding one.
+      - name: Build
+        run: dotnet build -c Release --no-restore --no-incremental
+
+      - name: Test
+        run: dotnet test -c Release --no-build --verbosity normal
+
+      - name: Pack
+        run: dotnet pack -c Release --no-build -o artifacts
+
+      - name: List the packages
+        run: ls -l artifacts
+
+      # --skip-duplicate makes a re-run harmless instead of a hard failure. The .snupkg
+      # symbol packages are picked up automatically from alongside each .nupkg.
+      - name: Push to nuget.org
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "The NUGET_API_KEY repository secret is not set." >&2
+            exit 1
+          fi
+          dotnet nuget push "artifacts/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate
+
+      # Keeps the built packages downloadable from the run even on a dry run, so a
+      # failed publish does not mean rebuilding to inspect what would have shipped.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ steps.version.outputs.version }}
+          path: artifacts/*
+          if-no-files-found: error
