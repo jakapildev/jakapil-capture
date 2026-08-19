@@ -45,7 +45,7 @@ public class JakapilCaptureMiddlewareTests
     /// internal test seam, so these pipeline-focused tests are independent of the real process environment
     /// (never depends on whether <c>JAKAPIL_ANON_KEY</c> happens to be set on the machine running the tests).
     /// Anonymization's own behavior is covered separately in <c>Anonymization/AnonymizerTests.cs</c>.</summary>
-    private static IAnonymizer PassThroughAnonymizer() => new Anonymizer(key: null, new AnonymizationOptions(), []);
+    private static IAnonymizer PassThroughAnonymizer() => new Anonymizer(key: null, scopeRef: null, new AnonymizationOptions(), []);
 
     /// <summary>
     /// Registers the real ADR-0003 replay-verification stack (key ring, nonce cache, verifier) with no

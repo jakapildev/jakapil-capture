@@ -31,7 +31,7 @@ internal enum SyntheticValueShape
 
 /// <summary>
 /// Deterministic synthetic PII generator (ADR-0002 §7):
-/// <c>synthetic = generator(kind, HMAC(key, tenant‖project‖env‖kind‖rawValue))</c>. Determinism is a
+/// <c>synthetic = generator(kind, HMAC(key, scopeRef‖kind‖rawValue))</c>. Determinism is a
 /// deliberate design choice (§7): the same production value always synthesizes to the same replacement, so
 /// interaction dedup stays stable, <c>DynamicNoiseLearner</c> converges correctly, and request→response echo
 /// relationships (e.g. a name submitted in a POST body reappearing in the 201 response) survive anonymization.
@@ -53,12 +53,12 @@ internal static class SyntheticPiiGenerator
     /// number type, or fail the target's model binding on a query/route/header value), so the shape-preserving
     /// generator always wins for a non-text shape, regardless of field name.</param>
     public static string Generate(
-        string? fieldName, string rawValue, ReadOnlySpan<byte> key, AnonymizationScope scope, string emailDomain,
+        string? fieldName, string rawValue, ReadOnlySpan<byte> key, string scopeRef, string emailDomain,
         SyntheticValueShape shape = SyntheticValueShape.Text)
     {
         var normalized = fieldName is null ? string.Empty : FieldNameRules.Normalize(fieldName);
         var kindForSeed = normalized.Length == 0 ? "generic" : normalized;
-        var seed = FingerprintGenerator.ComputeSyntheticSeed(key, scope.TenantId, scope.ProjectId, scope.Environment, kindForSeed, rawValue);
+        var seed = FingerprintGenerator.ComputeSyntheticSeed(key, scopeRef, kindForSeed, rawValue);
 
         switch (shape)
         {

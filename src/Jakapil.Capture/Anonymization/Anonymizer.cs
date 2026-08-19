@@ -34,7 +34,7 @@ public interface IAnonymizer
 
     /// <summary>
     /// ADR-0003 §5: masks a LIVE replay-response body the SAME way <see cref="Anonymize"/> masks a captured
-    /// one — same key, same <see cref="AnonymizationOptions.Scope"/>, same <see cref="FieldClassifier"/>
+    /// one — same key, same ingest-key-derived scope, same <see cref="FieldClassifier"/>
     /// decisions — EXCEPT:
     /// <list type="bullet">
     /// <item><see cref="FieldClass.FlowFingerprint"/> leaves are left as their live plaintext value instead of
@@ -139,7 +139,7 @@ public sealed class Anonymizer : IAnonymizer
     /// subject copies (GIZLILIK-1/G1 decision table): the SAME semantic kind, used for all three, is what
     /// guarantees <see cref="ComputeSubjectFingerprint"/> derives an IDENTICAL digest for the same raw value —
     /// the HMAC in <see cref="FingerprintGenerator.ComputeCorrelationDigest"/> is a pure function of
-    /// (key, scope, semanticKind, rawValue), so no explicit cross-field caching is needed, only this shared
+    /// (key, scopeRef, semanticKind, rawValue), so no explicit cross-field caching is needed, only this shared
     /// constant.</summary>
     private const string SubjectSemanticKind = "subject";
 
@@ -169,26 +169,37 @@ public sealed class Anonymizer : IAnonymizer
 
     private readonly byte[]? _key;
     private readonly int _keyVersion;
-    private readonly AnonymizationScope _scope;
+    private readonly string? _scopeRef;
     private readonly IReadOnlyDictionary<string, FieldClass> _fieldPolicy;
     private readonly string _emailDomain;
     private readonly string[] _anonymizedHeaderNames;
 
-    /// <summary>DI constructor: resolves the key from the configured environment variable at construction time
-    /// (once, since this is registered as a singleton) and logs a startup warning if it is unset.</summary>
+    /// <summary>DI constructor: resolves the key from the configured environment variable and the
+    /// domain-separation scope from the ingest key, both at construction time (once, since this is registered
+    /// as a singleton), logging a startup warning if either is unavailable.</summary>
     public Anonymizer(IOptions<JakapilCaptureOptions> options, ILogger<Anonymizer> logger)
-        : this(ResolveKeyBytes(options.Value.Anonymization, logger), options.Value.Anonymization, options.Value.AnonymizedHeaderNames)
+        : this(
+            ResolveKeyBytes(options.Value.Anonymization, logger),
+            ResolveScopeRef(options.Value.IngestKey, logger),
+            options.Value.Anonymization,
+            options.Value.AnonymizedHeaderNames)
     {
     }
 
-    /// <summary>Test/advanced seam: takes the resolved key bytes directly (or null for pass-through mode)
-    /// rather than reading the environment, so unit tests can be deterministic and independent of the host's
-    /// actual environment variables.</summary>
-    internal Anonymizer(byte[]? key, AnonymizationOptions anonOptions, string[] anonymizedHeaderNames)
+    /// <summary>Test/advanced seam: takes the resolved key bytes (or null for pass-through mode) and the scope
+    /// reference directly rather than reading the environment and parsing the ingest key, so unit tests can be
+    /// deterministic and independent of the host's actual environment variables.</summary>
+    /// <param name="key">The resolved HMAC key bytes, or null for pass-through mode.</param>
+    /// <param name="scopeRef">The 16-character scope reference taken from the ingest key
+    /// (<see cref="IngestKeyFormat"/>), or null when no well-formed ingest key was configured — which, exactly
+    /// like a null <paramref name="key"/>, forces pass-through mode.</param>
+    /// <param name="anonOptions">The anonymization settings (key version, field policy, synthetic email domain).</param>
+    /// <param name="anonymizedHeaderNames">The header names subject to anonymization.</param>
+    internal Anonymizer(byte[]? key, string? scopeRef, AnonymizationOptions anonOptions, string[] anonymizedHeaderNames)
     {
         _key = key;
         _keyVersion = anonOptions.KeyVersion;
-        _scope = anonOptions.Scope;
+        _scopeRef = scopeRef;
         _fieldPolicy = new Dictionary<string, FieldClass>(anonOptions.FieldPolicy, StringComparer.OrdinalIgnoreCase);
         _emailDomain = string.IsNullOrWhiteSpace(anonOptions.SyntheticEmailDomain) ? "example.com" : anonOptions.SyntheticEmailDomain;
         _anonymizedHeaderNames = anonymizedHeaderNames;
@@ -213,8 +224,30 @@ public sealed class Anonymizer : IAnonymizer
         return Encoding.UTF8.GetBytes(raw);
     }
 
+    /// <summary>Derives the domain-separation scope from the scope-reference half of the ingest key. Returns
+    /// null (pass-through mode) and logs a visible warning when no well-formed key is configured — the same
+    /// spirit as <see cref="ResolveKeyBytes"/>: a scope that could not be established must never silently
+    /// degrade into an empty one, because that would place every such deployment into a single shared digest
+    /// domain. A running, capture-enabled host cannot reach this branch, because
+    /// <c>JakapilCaptureOptionsValidator</c> rejects a missing or malformed ingest key at startup.</summary>
+    private static string? ResolveScopeRef(string? ingestKey, ILogger logger)
+    {
+        if (IngestKeyFormat.TryParse(ingestKey, out var scopeRef))
+        {
+            return scopeRef;
+        }
+
+        logger.LogWarning(
+            "Jakapil: the ingest key is missing or is not in the expected {ExpectedShape} format, so the " +
+            "anonymization scope could not be derived from it. Capture is running in PASS-THROUGH mode and " +
+            "will send PLAINTEXT request/response data to the collector. Regenerate the ingest key in the " +
+            "Jakapil UI.",
+            IngestKeyFormat.ExpectedShape);
+        return null;
+    }
+
     /// <inheritdoc />
-    public bool HasKey => _key is not null;
+    public bool HasKey => _key is not null && _scopeRef is not null;
 
     /// <inheritdoc />
     public string Scheme => SchemeId;
@@ -225,7 +258,7 @@ public sealed class Anonymizer : IAnonymizer
     /// <inheritdoc />
     public CapturedInteraction Anonymize(CapturedInteraction interaction)
     {
-        if (_key is null)
+        if (_key is null || _scopeRef is null)
         {
             return interaction;
         }
@@ -264,7 +297,7 @@ public sealed class Anonymizer : IAnonymizer
             Identity = TransformIdentity(interaction.Identity),
             Correlation = TransformCorrelation(interaction.Correlation),
             Auth = TransformAuthBinding(interaction.Auth),
-            Anon = new AnonymizationInfo { Scheme = SchemeId, KeyVersion = _keyVersion },
+            Anon = new AnonymizationInfo { Scheme = SchemeId, KeyVersion = _keyVersion, ScopeRef = _scopeRef },
         };
     }
 
@@ -398,7 +431,7 @@ public sealed class Anonymizer : IAnonymizer
     /// <see cref="CorrelationSignals.SubjectId"/>, <see cref="AuthBinding.SubjectId"/>) route through, so the
     /// "same digest for the same raw value" guarantee is structural — one shared <see cref="SubjectSemanticKind"/>
     /// constant plus <see cref="FingerprintGenerator.ComputeCorrelationDigest"/>'s determinism (it is a pure
-    /// function of key/scope/semanticKind/rawValue) means identical input ALWAYS produces an identical digest,
+    /// function of key/scopeRef/semanticKind/rawValue) means identical input ALWAYS produces an identical digest,
     /// with no cross-field cache to keep in sync.
     /// </summary>
     private string? ComputeSubjectFingerprint(string? subjectId) => FingerprintValue(SubjectSemanticKind, subjectId);
@@ -416,7 +449,7 @@ public sealed class Anonymizer : IAnonymizer
         }
 
         var digest = FingerprintGenerator.ComputeCorrelationDigest(
-            _key!, _scope.TenantId, _scope.ProjectId, _scope.Environment, semanticKind, rawValue);
+            _key!, _scopeRef!, semanticKind, rawValue);
         return ValueEnvelopeWriter.WriteFingerprint("u", semanticKind, _keyVersion, digest);
     }
 
@@ -663,7 +696,7 @@ public sealed class Anonymizer : IAnonymizer
 
                 var role = (fieldName is not null ? FieldNameRules.ExtractIdentifierRole(fieldName) : null) ?? "id";
                 var digest = FingerprintGenerator.ComputeCorrelationDigest(
-                    _key!, _scope.TenantId, _scope.ProjectId, _scope.Environment, role, rawValue);
+                    _key!, _scopeRef!, role, rawValue);
                 return ClassifiedValue.Quoted(ValueEnvelopeWriter.WriteFingerprint(jsonType, role, _keyVersion, digest));
             }
 
@@ -674,7 +707,7 @@ public sealed class Anonymizer : IAnonymizer
                     return ClassifiedValue.Quoted(rawValue);
                 }
 
-                var synthetic = SyntheticPiiGenerator.Generate(fieldName, rawValue, _key!, _scope, _emailDomain, shape);
+                var synthetic = SyntheticPiiGenerator.Generate(fieldName, rawValue, _key!, _scopeRef!, _emailDomain, shape);
                 return shape is SyntheticValueShape.Integer or SyntheticValueShape.Decimal
                     ? ClassifiedValue.Literal(synthetic)
                     : ClassifiedValue.Quoted(synthetic);
@@ -780,7 +813,7 @@ public sealed class Anonymizer : IAnonymizer
     /// <inheritdoc />
     public ReplayBodyMaskingResult? MaskReplayResponseBody(ReadOnlyMemory<byte> bodyBytes, string? contentType)
     {
-        if (_key is null)
+        if (!HasKey)
         {
             return null;
         }
@@ -816,12 +849,12 @@ public sealed class Anonymizer : IAnonymizer
     /// <inheritdoc />
     public ReplayHeaderDecision ClassifyReplayResponseHeader(string headerName, string headerValue)
     {
-        // No key => no masking is possible at all (mirrors MaskReplayResponseBody's own guard); the header is
-        // reported as "passed live" in the trivial sense that nothing touched it — the caller only invokes this
-        // after body masking already succeeded, so in practice _key is never null here, but this keeps the
-        // method safe to call standalone (e.g. from a unit test) without risking the `_key!` null-forgiving
-        // operator inside ApplyClass's FlowFingerprint/SyntheticPii branches.
-        if (_key is not null && _fieldPolicy.TryGetValue(headerName, out var overridden))
+        // No key (or no scope) => no masking is possible at all (mirrors MaskReplayResponseBody's own guard);
+        // the header is reported as "passed live" in the trivial sense that nothing touched it — the caller only
+        // invokes this after body masking already succeeded, so in practice HasKey is never false here, but this
+        // keeps the method safe to call standalone (e.g. from a unit test) without risking the
+        // `_key!`/`_scopeRef!` null-forgiving operators inside ApplyClass's FlowFingerprint/SyntheticPii branches.
+        if (HasKey && _fieldPolicy.TryGetValue(headerName, out var overridden))
         {
             // Customer FieldPolicy veto always wins over the RunCredential default: run the SAME
             // classification pipeline TransformHeaders/TransformTransportValue already use for an allowlisted

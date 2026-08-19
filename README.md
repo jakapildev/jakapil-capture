@@ -45,6 +45,53 @@ builder.Services.AddJakapilCapture(options =>
 });
 ```
 
+## The ingest key
+
+An ingest key is issued **per environment** from the Jakapil UI and has a fixed shape:
+
+```
+jk_<16 uppercase-hex scope ref>_<64 uppercase-hex secret>
+```
+
+The key is always used **whole**: it goes into the `X-Jakapil-Key` header verbatim, exactly as
+before. The SDK never splits it on the wire. What it does do is read the two halves apart locally,
+because they mean different things:
+
+- **`<secret>`** — the half the collector authenticates you with. Treat the key as a secret:
+  supply it through an environment variable or a secret store, never hard-coded in source or
+  `appsettings.json`.
+- **`<scope ref>`** — a stable, **non-secret** label of the environment the key was issued for. The
+  collector already knows it (it stores it next to the environment) and this SDK uses it as the
+  domain-separation scope under which every anonymization digest is derived, then reports it back in
+  `CapturedInteraction.Anon.ScopeRef` so the collector can tell which scope a payload belongs to.
+
+A key that does not match this shape is rejected **at startup** (see "Anonymization is required by
+default" below for what a startup failure looks like) rather than being silently accepted:
+
+```
+The ingest key (IngestKey) is malformed: it must have the shape
+jk_<16 uppercase-hex scope ref>_<64 uppercase-hex secret>. Keys issued before this format are no
+longer valid — regenerate the key for this environment in the Jakapil UI and update the
+configuration.
+```
+
+### Rotating the ingest key vs. rotating the anonymization key
+
+These two rotations have opposite consequences, and the difference is worth internalizing before you
+rotate either one:
+
+- **Rotating the ingest key does *not* break correlation.** The scope ref is a property of the
+  environment, not of the key material, so a freshly generated key for the same environment carries
+  the *same* scope ref. Every digest keeps coming out the same, and the corpus you already captured
+  stays correlatable against everything you capture afterwards. Rotate an ingest key as often as your
+  secret-handling policy demands.
+- **Rotating the anonymization key (`JAKAPIL_ANON_KEY`) *does* break correlation, by design.** That
+  key is the HMAC key itself, so every fingerprint and every synthetic value changes. Nothing
+  captured under the new key correlates with anything captured under the old one, and scenarios
+  generated from the older corpus have to be regenerated. Bump `Anonymization.KeyVersion` when you do
+  it: the version travels in every envelope and is what marks the rotation boundary, so the two key
+  spaces are never mistaken for one.
+
 ## Configuration options
 
 | Option | Type | Default | Description |
@@ -52,13 +99,22 @@ builder.Services.AddJakapilCapture(options =>
 | `Enabled` | `bool` | `true` | Main on/off switch. When `false`, the middleware is a pure passthrough. |
 | `SampleRate` | `double` | `1.0` | The fraction of requests to capture, `[0, 1]`. `1.0` = capture everything. |
 | `CollectorUri` | `string?` | `null` | The root address of the collector where captured interactions are sent. If left empty, the export worker stays idle. |
-| `IngestKey` | `string?` | `null` | The raw ingest key sent to the collector in the `X-Jakapil-Key` header. |
+| `IngestKey` | `string?` | `null` | The raw ingest key, sent to the collector whole in the `X-Jakapil-Key` header. Must have the `jk_<scope ref>_<secret>` shape above; a malformed key fails startup. |
 | `MaxInlineBodyBytes` | `int` | `1048576` (1 MiB) | Bodies at or below this size are captured inline; larger ones are truncated and flagged as `Truncated`. |
+| `Anonymization.RequireAnonymization` | `bool` | `true` | When `true`, starting the host without the anonymization key configured is a **startup failure** instead of a silent downgrade to plaintext capture. See "Anonymization is required by default" below. |
+| `Anonymization.KeyEnvironmentVariable` | `string` | `"JAKAPIL_ANON_KEY"` | The **name** of the environment variable the HMAC anonymization key is read from. Only the name is configured here — the key value itself never belongs in this options object, so it can never be logged, serialized, or committed to a config file. |
+| `Anonymization.KeyVersion` | `int` | `1` | The key version tag written into every fingerprint envelope. A rotation boundary: two versions are separate, non-correlating digest spaces. Must be non-negative. |
+| `Anonymization.SyntheticEmailDomain` | `string` | `"example.com"` | The domain used for synthesized email addresses. The real domain is never preserved; point this at your own staging/test domain if you prefer. |
+| `Anonymization.FieldPolicy` | `IDictionary<string, FieldClass>` | empty | Per-field classification overrides, matched case-insensitively. Always wins over every built-in rule. |
 
 Other settings (`MaxCapturedResponseBytes`, `StreamingContentTypes`, `QueueCapacity`,
 `SensitiveHeaderNames`, `CorrelationHeaderNames`, `ExportBatchMaxItems`,
-`ExportFlushIntervalSeconds`) ship with sensible defaults; see the `JakapilCaptureOptions`
-XML documentation comments for details.
+`ExportFlushIntervalSeconds`) ship with sensible defaults; see the `JakapilCaptureOptions` and
+`AnonymizationOptions` XML documentation comments for details.
+
+The anonymization scope is **not** configurable: it comes from the ingest key's scope ref (see above),
+so it is always the real, server-known identity of the target environment and cannot be left blank by
+accident.
 
 ## Identity capture from multi-identity principals
 
@@ -95,12 +151,55 @@ type is duplicated, so the common single-valued case reads `Claims` as before an
 
 ## Field anonymization
 
-When `AnonymizationOptions` is configured with a key (`JAKAPIL_ANON_KEY` by default), every captured
+With an anonymization key configured (read from `JAKAPIL_ANON_KEY` by default), every captured
 request/response leaf is classified and transformed before it leaves your process — no raw production
 value (name, email, password, flow identifier, ...) is ever sent to the collector. See
 `Jakapil.Capture.Anonymization.FieldClass` for the four possible outcomes (`SafeLiteral`,
 `FlowFingerprint`, `SyntheticPii`, `SecretTombstone`) and `AnonymizationOptions.FieldPolicy` for the
 customer override that always wins over the built-in rules below.
+
+Fingerprints and synthetic values are derived from the anonymization key **and** the scope ref taken
+from your ingest key:
+
+```
+digest = HMAC-SHA256(key, scopeRef \0 semanticKind \0 value)[0..16]
+```
+
+The scope ref is what keeps two environments — or two customers — from ever producing the same digest
+for the same raw value. Because it is issued by the server rather than configured locally, it cannot
+be left blank, and it cannot accidentally differ between two deployments of the same environment.
+
+### Anonymization is required by default (fail-closed)
+
+`Anonymization.RequireAnonymization` defaults to `true`. With capture enabled (`Enabled = true`) and
+that default in place, **the host does not start** unless the anonymization key environment variable
+is set. Options validation fails, `ValidateOnStart` turns the failure into an
+`OptionsValidationException`, and you get this message:
+
+```
+Anonymization is required (Anonymization.RequireAnonymization=true) but the environment variable
+'JAKAPIL_ANON_KEY' is not set. Without that key, capture sends PLAINTEXT production request and
+response data to the collector. Set 'JAKAPIL_ANON_KEY' to the anonymization key, or opt out
+deliberately with Anonymization.RequireAnonymization = false.
+```
+
+**Why the default is `true`.** Without a key, the SDK falls back to pass-through mode: raw production
+request and response bodies, identity fields and all, go to the collector in the clear. Earlier
+versions did exactly that on a missing key, announcing it with nothing louder than a startup log
+warning — which, on a busy service, is scrolled past in seconds and then lives on undetected for
+months. A misconfiguration whose worst case is "production data has been leaving the building" is not
+one a warning is allowed to carry; it has to stop the process.
+
+**Opting out is deliberate and explicit.** A local sandbox with no real data in it is a legitimate
+reason to run without a key — you just have to say so:
+
+```csharp
+options.Anonymization.RequireAnonymization = false;   // no real data in this environment
+```
+
+With it set to `false`, the previous behavior returns unchanged: a missing key logs a pass-through
+warning and capture continues in plaintext. The check is also skipped entirely when capture itself is
+off (`Enabled = false`), since nothing is being sent.
 
 ### Identity, correlation, and auth-binding fields are anonymized too
 
@@ -113,7 +212,7 @@ and every claim your identity provider issues went to the collector as plaintext
 request/response body was fully anonymized alongside it.
 
 `Anonymizer.Anonymize` now covers those three blocks too, using the exact same one-way HMAC
-fingerprint as the rest of this SDK — same key, same `Scope`. The three copies of a subject id that
+fingerprint as the rest of this SDK — same key, same scope ref. The three copies of a subject id that
 appear across `Identity`, `Correlation`, and `AuthBinding` are guaranteed to fingerprint to the
 **identical** value, so correlating a user across all three survives anonymization. The scheme
 identifier reported in `CapturedInteraction.Anon` changed to reflect the wider coverage — this is a
@@ -131,9 +230,13 @@ assumed safe. `IdentityInfo.MultiValuedClaims` (a multi-role user's extra `role`
 claim type repeated more than once) goes through the exact same rule: role values stay plaintext,
 everything else is fingerprinted with the same key and scope as its `Claims` counterpart.
 
-As before, with no anonymization key configured, none of this runs: the whole interaction — body,
-route/query, and now these identity/correlation fields too — passes through unchanged, and you still
-get the startup warning about running in pass-through mode.
+With no anonymization key configured, none of this runs: the whole interaction — body, route/query,
+and these identity/correlation fields too — passes through unchanged, with a startup warning about
+pass-through mode. Reaching that state now takes a deliberate
+`Anonymization.RequireAnonymization = false`; with the default in place the host refuses to start
+instead (see "Anonymization is required by default" above). Pass-through is also what you get if no
+well-formed ingest key could be parsed, since the scope ref every digest is derived under comes from
+it — but that, too, is caught at startup before any traffic is captured.
 
 ### Generic `name` is context-sensitive (since v1.2.0)
 
@@ -251,7 +354,7 @@ that request that never happen for ordinary traffic:
 1. **It is never captured/exported.** Replay traffic would otherwise pollute your captured corpus with its own
    test data, so a verified replay request is unconditionally excluded from capture — independent of
    `SampleRate` or even `Enabled`.
-2. **The response body is masked on the way out**, using the exact same anonymization key, `Scope`, and field
+2. **The response body is masked on the way out**, using the exact same anonymization key, scope ref, and field
    classification as ordinary capture-side anonymization (see "Field anonymization" above) — so your API's
    *live* production-shaped response ("Mug") comes back anonymized ("Sage Blake") exactly like the *captured*
    corpus value it is being compared against, letting equality-style assertions built from anonymized capture
@@ -345,10 +448,10 @@ RunCredential leaves produces the exact same header as before:
 - **`liveHeaders=`** (since v1.2.0) — a comma-separated list of header names (never encoded — an HTTP header name cannot
   contain `,`/`;`) that passed through live; only ever `Set-Cookie` and/or `Location`.
 
-Examples: `v1;scheme=hmac-sha256-v1;keyVersion=1` (nothing to declare) ·
-`v1;scheme=hmac-sha256-v1;keyVersion=1;body=unmasked-nonjson` (non-JSON body, forwarded unchanged) ·
-`v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.token;liveHeaders=Set-Cookie` ·
-`v1;scheme=hmac-sha256-v1;keyVersion=1;live=$.auth.sessionToken,$.items[*].cursor`.
+Examples: `v1;scheme=hmac-sha256-v2;keyVersion=1` (nothing to declare) ·
+`v1;scheme=hmac-sha256-v2;keyVersion=1;body=unmasked-nonjson` (non-JSON body, forwarded unchanged) ·
+`v1;scheme=hmac-sha256-v2;keyVersion=1;live=$.token;liveHeaders=Set-Cookie` ·
+`v1;scheme=hmac-sha256-v2;keyVersion=1;live=$.auth.sessionToken,$.items[*].cursor`.
 
 The header is **absent** — fail-closed, exactly like before v1.2.0 — for every case where the response body
 could not even be classified, as opposed to being deliberately non-JSON: a malformed JSON body (`Content-Type`
@@ -388,9 +491,10 @@ builder.Services.AddJakapilCapture(options =>
   has closed.
 - `Replay.ExpectedTenantId`/`ExpectedEnvironmentId` are optional extra binding checks — when set, a signature
   for a different tenant/environment id than configured here is treated as invalid. They are independent of
-  `Anonymization.Scope` (that field feeds HMAC domain separation, a different concern with a different
-  correctness bar — changing it changes every synthetic value you have ever seen, so replay identity binding
-  deliberately gets its own, separately-optional fields instead of reusing it). **Leaving them unset is not
+  the anonymization scope ref taken from your ingest key (that value feeds HMAC domain separation, a different
+  concern with a different correctness bar — it decides every synthetic value you have ever seen, so replay
+  identity binding deliberately gets its own, separately-optional fields instead of reusing it). **Leaving
+  them unset is not
   wide open** (the key ring is still per-project), but it does mean a run signed for one environment could be
   replayed against a different instance of the same project sharing the same public key. The real protection
   for production is the switch below, not these fields — a production deployment should keep replay
@@ -434,6 +538,100 @@ section and the ADR this feature implements for the full reasoning.
 ## Version history
 
 Full notes for each release: https://github.com/jakapildev/jakapil-capture/releases
+
+### 2.0.0
+
+**Breaking changes.**
+
+- **`AnonymizationScope` and `AnonymizationOptions.Scope` are removed.** The HMAC domain-separation
+  scope is no longer configured in your application; it is parsed out of the ingest key's scope-ref
+  half (`jk_<scope ref>_<secret>`). Any code that set `options.Anonymization.Scope` no longer compiles
+  and should simply drop those lines. The reason is blunt: the scope was a set of free-text strings a
+  deployment could — and routinely did — leave empty, which put every such deployment into a single
+  shared digest domain, i.e. no separation at all. A server-issued scope ref cannot be left blank and
+  cannot silently disagree between two deployments of the same environment.
+- **Every digest changes.** The digest input went from
+  `tenantId \0 projectId \0 environment \0 semanticKind \0 value` to `scopeRef \0 semanticKind \0 value`,
+  so every fingerprint and every synthetic value this SDK produces is different from what earlier
+  versions produced. **Correlation with any previously captured corpus is lost, and scenarios generated
+  from older captures must be regenerated.** This is not a defect; it is the cost of the scope actually
+  being applied where it previously was not.
+- **A malformed ingest key now fails startup.** The key must parse as
+  `jk_<16 uppercase-hex scope ref>_<64 uppercase-hex secret>`. Keys issued before this format are no
+  longer valid — regenerate the key for the environment in the Jakapil UI. The key still goes to the
+  collector whole and unchanged on the wire.
+- **Anonymization is required by default** (`Anonymization.RequireAnonymization`, new, defaults to
+  `true`). With capture enabled and the anonymization key environment variable unset, options
+  validation fails and the host does not start. Earlier versions shipped **plaintext** production
+  traffic in that situation, announced only by a startup log warning. Opt out deliberately with
+  `Anonymization.RequireAnonymization = false` — appropriate for a local sandbox holding no real data,
+  and nowhere else.
+
+**Additions.** `AnonymizationInfo.ScopeRef` carries the scope ref every digest in the payload was
+derived under. It is optional and nullable, so the wire contract stays append-only: a collector reading
+payloads from older SDKs still deserializes them, and `null` there means "an older SDK that derived its
+digests under a locally configured scope", not an error.
+
+**Note on rotation.** Rotating the ingest key does *not* invalidate your corpus — the scope ref belongs
+to the environment, not to the key material. Rotating the anonymization key does. See "Rotating the
+ingest key vs. rotating the anonymization key".
+
+### 1.4.0
+
+**Identity fields are read from one identity, consistently.** `HttpContext.User` often carries several
+`ClaimsIdentity` instances (an ASP.NET Core Identity cookie identity next to a JWT bearer identity is a
+common shape). `AuthenticationScheme`, `UserName`, and `IsAuthenticated` were read from the principal's
+primary identity while `SubjectId` was resolved with `principal.FindFirst`, which searches *every*
+identity — so the four fields could silently describe different identities. A live measurement found 876
+of 905 captured interactions reporting the cookie scheme for requests the client had authenticated with
+a bearer token. One selection rule now backs all of them: the first authenticated identity, falling back
+to the primary identity. **Observable change:** `SubjectId` is no longer resolved across all identities,
+so a principal whose selected identity carries no `NameIdentifier`/`sub` claim now reports `null` where
+an earlier version reported another identity's subject. Claims stay merged across every identity.
+
+**Tokens are attributed to the subject the response names.** When a login response mints a token, it
+belongs to the subject that response identifies, not to whoever happened to be signed in on the
+connection — a service account performing the login, or a stale session, previously took the credit.
+The caller's identity remains the fallback for responses carrying no recognisable subject field.
+
+**Repeated claim types are preserved.** `IdentityInfo.Claims` maps a claim type to a single value, so a
+multi-role user collapsed to one role, last writer wins — and the server matches replay test users by
+the captured role set, so the identity was mis-modelled and matching picked the wrong account or skipped
+the scenario. The new optional `IdentityInfo.MultiValuedClaims` carries every value of any claim type
+that appears more than once; it stays `null` otherwise, so the common single-valued case is unaffected
+and servers that do not know the field keep working. It goes through the same anonymization transform as
+`Claims` — role types plaintext, everything else fingerprinted with the same semantic kind — so it is
+not a second door around anonymization.
+
+### 1.3.1
+
+**Identity, correlation, and auth-binding fields were never anonymized.** `Anonymize` rewrote only the
+request and response; `Identity` (`SubjectId`, `UserName`, every claim), `CorrelationSignals`
+(`SubjectId`, `SessionCookieId`, `ClientConnectionId`, `CustomCorrelationHeader`) and
+`AuthBinding.SubjectId` passed through untouched. With a key configured and the body fully anonymized
+alongside it, the JWT `sub`, the user name, and every claim — email and full name included — still
+reached the collector in plaintext and were persisted there. All three blocks now go through the same
+keyed fingerprint, with role claims the one deliberate exception (an authorization category identifies
+nobody, the set is small enough to be dictionary-attacked anyway, and it is the signal role-aware test
+user matching depends on). The three copies of a subject id fingerprint identically, so correlating a
+user across them survives. `SessionCookieId`, previously an unkeyed plain SHA-256 with no domain
+separation, joined the keyed path. The scheme identifier moved from `hmac-sha256-v1` to
+`hmac-sha256-v2` — the honest way to tell the collector this payload covers identity fields too; the
+wire contract's shape is unchanged.
+
+**Pagination and counter parameters were corrupted by anonymization.**
+`?PageSize=10&PageIndex=0` came back as `?PageSize=35&PageIndex=1`: neither name was recognized, so both
+fell to the unknown-field fail-safe. Against a 12-item catalog, page 35 of 35 is empty, so the generated
+scenario failed its assertion and stayed permanently red — anonymization was changing the *meaning* of
+the request. A transport-only exception list (`pageSize`, `pageIndex`, `pageNumber`, `perPage`, `offset`,
+`skip`, `take`, `top`) now passes these through unchanged when they appear as a route, query, or header
+value — never in a JSON body — and only when the value actually looks numeric, so `?pageSize=a@b.com`
+can never leak. Non-English names are not covered; `FieldPolicy` is the escape hatch. See
+"Pagination/counter query, route, and header values pass through unchanged".
+
+Also: this Version history section itself, and a correction attributing the `body=` confirmation field
+to 1.2.1 rather than 1.2.0. There is no 1.3.0 release — it was packed to a local feed before the second
+fix above landed, so the fixed content shipped under a new number rather than reusing one.
 
 ### 1.2.1
 

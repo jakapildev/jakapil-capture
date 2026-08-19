@@ -7,12 +7,14 @@ namespace Jakapil.Capture.Tests.Anonymization;
 public sealed class SyntheticPiiGeneratorTests
 {
     private static readonly byte[] Key = "test-anon-key"u8.ToArray();
-    private static readonly AnonymizationScope Scope = new() { TenantId = "t1", ProjectId = "p1", Environment = "prod" };
+    /// <summary>A well-formed scope reference — the 16 uppercase-hex prefix half of an ingest key, which is
+    /// where the synthetic-PII seed now takes its domain separation from.</summary>
+    private const string ScopeRef = "0123456789ABCDEF";
 
     [Fact]
     public void GenerateEmail_NeverPreservesRealDomain()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, Scope, "example.com");
+        var synthetic = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, ScopeRef, "example.com");
 
         Assert.DoesNotContain("gercekfirma.com", synthetic);
         Assert.EndsWith("@example.com", synthetic);
@@ -21,7 +23,7 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void GenerateEmail_UsesConfiguredDomain()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("email", "someone@real.example", Key, Scope, "customer-staging.test");
+        var synthetic = SyntheticPiiGenerator.Generate("email", "someone@real.example", Key, ScopeRef, "customer-staging.test");
 
         Assert.EndsWith("@customer-staging.test", synthetic);
     }
@@ -29,8 +31,8 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void Generate_IsDeterministic_SameInputSameOutput()
     {
-        var first = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, Scope, "example.com");
-        var second = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, Scope, "example.com");
+        var first = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, ScopeRef, "example.com");
+        var second = SyntheticPiiGenerator.Generate("email", "ali@gercekfirma.com", Key, ScopeRef, "example.com");
 
         Assert.Equal(first, second);
     }
@@ -38,8 +40,8 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void Generate_DifferentRawValues_DifferentOutputs()
     {
-        var first = SyntheticPiiGenerator.Generate("email", "alice@example.org", Key, Scope, "example.com");
-        var second = SyntheticPiiGenerator.Generate("email", "bob@example.org", Key, Scope, "example.com");
+        var first = SyntheticPiiGenerator.Generate("email", "alice@example.org", Key, ScopeRef, "example.com");
+        var second = SyntheticPiiGenerator.Generate("email", "bob@example.org", Key, ScopeRef, "example.com");
 
         Assert.NotEqual(first, second);
     }
@@ -47,7 +49,7 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void GenerateName_NeverContainsOriginalName()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("fullName", "Ayşe Yılmaz", Key, Scope, "example.com");
+        var synthetic = SyntheticPiiGenerator.Generate("fullName", "Ayşe Yılmaz", Key, ScopeRef, "example.com");
 
         Assert.DoesNotContain("Ayşe", synthetic);
         Assert.DoesNotContain("Yılmaz", synthetic);
@@ -56,7 +58,7 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void GenerateFreeText_NeverContainsOriginalText()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("description", "met with the customer at their office", Key, Scope, "example.com");
+        var synthetic = SyntheticPiiGenerator.Generate("description", "met with the customer at their office", Key, ScopeRef, "example.com");
 
         Assert.DoesNotContain("customer", synthetic);
         Assert.DoesNotContain("office", synthetic);
@@ -65,7 +67,7 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void GeneratePhone_UsesReservedFictionalRange()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("phone", "+905551234567", Key, Scope, "example.com");
+        var synthetic = SyntheticPiiGenerator.Generate("phone", "+905551234567", Key, ScopeRef, "example.com");
 
         Assert.StartsWith("+1-555-01", synthetic);
     }
@@ -76,7 +78,7 @@ public sealed class SyntheticPiiGeneratorTests
     public void Generate_IntegerShape_ProducesPlainIntegerText()
     {
         var synthetic = SyntheticPiiGenerator.Generate(
-            "pageSize", "10", Key, Scope, "example.com", SyntheticValueShape.Integer);
+            "pageSize", "10", Key, ScopeRef, "example.com", SyntheticValueShape.Integer);
 
         Assert.True(long.TryParse(synthetic, out _), $"'{synthetic}' does not parse as an integer.");
         Assert.DoesNotContain('.', synthetic);
@@ -88,7 +90,7 @@ public sealed class SyntheticPiiGeneratorTests
         // A field policy could route an arbitrarily large number through here — the synthetic replacement
         // must still fit comfortably inside a typical 32-bit consumer's int, regardless of the original's size.
         var synthetic = SyntheticPiiGenerator.Generate(
-            "count", "99999999999999999999", Key, Scope, "example.com", SyntheticValueShape.Integer);
+            "count", "99999999999999999999", Key, ScopeRef, "example.com", SyntheticValueShape.Integer);
 
         Assert.True(int.TryParse(synthetic, out _), $"'{synthetic}' overflows int32.");
     }
@@ -97,7 +99,7 @@ public sealed class SyntheticPiiGeneratorTests
     public void Generate_DecimalShape_ProducesDecimalText_NeverAWholeNumber()
     {
         var synthetic = SyntheticPiiGenerator.Generate(
-            "price", "19.99", Key, Scope, "example.com", SyntheticValueShape.Decimal);
+            "price", "19.99", Key, ScopeRef, "example.com", SyntheticValueShape.Decimal);
 
         Assert.Contains('.', synthetic);
         Assert.True(decimal.TryParse(synthetic, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _),
@@ -108,7 +110,7 @@ public sealed class SyntheticPiiGeneratorTests
     public void Generate_BooleanShape_ProducesTrueOrFalseText()
     {
         var synthetic = SyntheticPiiGenerator.Generate(
-            "active", "true", Key, Scope, "example.com", SyntheticValueShape.Boolean);
+            "active", "true", Key, ScopeRef, "example.com", SyntheticValueShape.Boolean);
 
         Assert.True(synthetic is "true" or "false", $"'{synthetic}' is not a boolean literal.");
     }
@@ -116,8 +118,8 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void Generate_IntegerShape_IsDeterministic_SameInputSameOutput()
     {
-        var first = SyntheticPiiGenerator.Generate("pageSize", "10", Key, Scope, "example.com", SyntheticValueShape.Integer);
-        var second = SyntheticPiiGenerator.Generate("pageSize", "10", Key, Scope, "example.com", SyntheticValueShape.Integer);
+        var first = SyntheticPiiGenerator.Generate("pageSize", "10", Key, ScopeRef, "example.com", SyntheticValueShape.Integer);
+        var second = SyntheticPiiGenerator.Generate("pageSize", "10", Key, ScopeRef, "example.com", SyntheticValueShape.Integer);
 
         Assert.Equal(first, second);
     }
@@ -125,7 +127,7 @@ public sealed class SyntheticPiiGeneratorTests
     [Fact]
     public void Generate_IntegerShape_NegativeInput_PreservesSign()
     {
-        var synthetic = SyntheticPiiGenerator.Generate("delta", "-42", Key, Scope, "example.com", SyntheticValueShape.Integer);
+        var synthetic = SyntheticPiiGenerator.Generate("delta", "-42", Key, ScopeRef, "example.com", SyntheticValueShape.Integer);
 
         Assert.StartsWith("-", synthetic);
         Assert.True(long.TryParse(synthetic, out _), $"'{synthetic}' does not parse as an integer.");
