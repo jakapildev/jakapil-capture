@@ -31,7 +31,7 @@ namespace Jakapil.Capture;
 /// from the Jakapil Runner. A request with no such header (ordinary traffic — the overwhelming majority) pays
 /// no cost at all and falls straight through to the existing capture logic, unchanged. A request with a VALID
 /// signature takes a completely separate path (<see cref="InvokeReplayAsync"/>): capture is skipped
-/// unconditionally, and the response is buffered in full and masked on the way out (same key/Scope/
+/// unconditionally, and the response is buffered in full and masked on the way out (same key/scope/
 /// classification as capture, ADR-0003 §5) before it ever reaches the caller. A request with an INVALID or
 /// malformed signature is treated EXACTLY like one with no header at all (INV-B3 — the signature is a
 /// behavior switch, never an authorization gate, and doubt always resolves to "no special behavior").

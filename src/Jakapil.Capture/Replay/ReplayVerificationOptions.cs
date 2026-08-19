@@ -36,10 +36,11 @@ public sealed class ReplayVerificationOptions
     /// check is SKIPPED entirely — see the class remarks for the residual risk that leaves.
     /// </summary>
     /// <remarks>
-    /// Deliberately NOT <see cref="Anonymization.AnonymizationScope.TenantId"/>: that field feeds HMAC domain
-    /// separation for every anonymization digest (ADR-0002 §6.2) — changing it changes every synthetic value a
-    /// customer has ever seen. Replay identity binding is a different concern with a different (and looser)
-    /// correctness bar, so it gets its own, independently optional, field here.
+    /// Deliberately NOT the anonymization scope: that value (the scope-reference half of the ingest key,
+    /// <see cref="IngestKeyFormat"/>) feeds HMAC domain separation for every anonymization digest
+    /// (ADR-0002 §6.2) — changing it changes every synthetic value a customer has ever seen. Replay identity
+    /// binding is a different concern with a different (and looser) correctness bar, so it gets its own,
+    /// independently optional, field here.
     /// </remarks>
     public string? ExpectedTenantId { get; set; }
 

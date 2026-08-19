@@ -99,6 +99,12 @@ public sealed class JakapilCaptureOptions
     public string? CollectorUri { get; set; }
 
     /// <summary>The raw ingest key sent as-is to the collector in the <c>X-Jakapil-Key</c> header.</summary>
+    /// <remarks>
+    /// The key has the shape <c>jk_&lt;scopeRef&gt;_&lt;secret&gt;</c> and is <b>always sent whole</b> — the
+    /// collector hashes the secret half and separately checks that the scope-reference half matches the target
+    /// environment. The same scope reference is what the SDK derives its anonymization domain separation from,
+    /// so a key that does not parse is rejected at startup rather than degrading capture silently.
+    /// </remarks>
     public string? IngestKey { get; set; }
 
     /// <summary>The maximum number of interactions sent in a single export request (collector upper bound is 1000).</summary>
@@ -116,6 +122,23 @@ public sealed class JakapilCaptureOptions
 /// </remarks>
 internal sealed class JakapilCaptureOptionsValidator : IValidateOptions<JakapilCaptureOptions>
 {
+    private readonly Func<string, string?> _environmentReader;
+
+    /// <summary>Production constructor: reads environment variables from the process environment.</summary>
+    public JakapilCaptureOptionsValidator()
+        : this(Environment.GetEnvironmentVariable)
+    {
+    }
+
+    /// <summary>Test seam: reads environment variables through the supplied delegate instead of the process
+    /// environment, so a test can decide whether the anonymization key "is set" without mutating global,
+    /// cross-test-shared state.</summary>
+    /// <param name="environmentReader">Maps an environment variable name to its value, or null when unset.</param>
+    internal JakapilCaptureOptionsValidator(Func<string, string?> environmentReader)
+    {
+        _environmentReader = environmentReader;
+    }
+
     /// <summary>Validates the given settings against the invariants; on violation, returns a failure with the reason.</summary>
     public ValidateOptionsResult Validate(string? name, JakapilCaptureOptions options)
     {
@@ -172,6 +195,27 @@ internal sealed class JakapilCaptureOptionsValidator : IValidateOptions<JakapilC
             if (string.IsNullOrWhiteSpace(options.IngestKey))
             {
                 failures.Add("When capture is enabled (Enabled=true), the ingest key (IngestKey) cannot be empty.");
+            }
+            else if (!IngestKeyFormat.TryParse(options.IngestKey, out _))
+            {
+                failures.Add(
+                    "The ingest key (IngestKey) is malformed: it must have the shape " + IngestKeyFormat.ExpectedShape +
+                    ". Keys issued before this format are no longer valid — regenerate the key for this environment " +
+                    "in the Jakapil UI and update the configuration.");
+            }
+
+            // Fail-closed by default: without the anonymization key, capture would ship raw production data.
+            // A startup failure here is deliberate — it is the same gate that already rejects an empty ingest
+            // key, and it is the only signal a log warning cannot be scrolled past.
+            if (options.Anonymization.RequireAnonymization
+                && string.IsNullOrWhiteSpace(_environmentReader(options.Anonymization.KeyEnvironmentVariable)))
+            {
+                failures.Add(
+                    "Anonymization is required (Anonymization.RequireAnonymization=true) but the environment variable '" +
+                    options.Anonymization.KeyEnvironmentVariable + "' is not set. Without that key, capture sends " +
+                    "PLAINTEXT production request and response data to the collector. Set '" +
+                    options.Anonymization.KeyEnvironmentVariable +
+                    "' to the anonymization key, or opt out deliberately with Anonymization.RequireAnonymization = false.");
             }
         }
 

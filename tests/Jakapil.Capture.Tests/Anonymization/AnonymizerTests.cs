@@ -12,10 +12,14 @@ public sealed class AnonymizerTests
 {
     private static readonly byte[] Key = "integration-test-key"u8.ToArray();
 
+    /// <summary>A well-formed scope reference — the 16 uppercase-hex characters an ingest key
+    /// (<c>jk_&lt;scopeRef&gt;_&lt;secret&gt;</c>) carries in its prefix, which is where the anonymization
+    /// domain separation now comes from.</summary>
+    private const string ScopeRef = "0123456789ABCDEF";
+
     private static readonly AnonymizationOptions Options = new()
     {
         KeyVersion = 3,
-        Scope = new AnonymizationScope { TenantId = "tenant-1", ProjectId = "project-1", Environment = "staging" },
     };
 
     private static CapturedInteraction BuildInteraction(
@@ -66,7 +70,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_NoKeyConfigured_ReturnsInteractionUnchanged_AndNeverSetsAnon()
     {
-        var anonymizer = new Anonymizer(key: null, Options, []);
+        var anonymizer = new Anonymizer(key: null, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"email":"real@customer.com"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -97,7 +101,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_SetsAnonMetadata_WhenKeyConfigured()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction();
 
         var result = anonymizer.Anonymize(interaction);
@@ -105,12 +109,13 @@ public sealed class AnonymizerTests
         Assert.NotNull(result.Anon);
         Assert.Equal("hmac-sha256-v2", result.Anon!.Scheme);
         Assert.Equal(3, result.Anon.KeyVersion);
+        Assert.Equal(ScopeRef, result.Anon.ScopeRef);
     }
 
     [Fact]
     public void Anonymize_SecretFieldInBody_ProducesTombstone_NeverFingerprint()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"password":"Gizli123!"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -123,7 +128,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_PiiFieldInBody_ProducesSyntheticValue_NeverOriginal()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"email":"ayse.yilmaz@gercekfirma.com"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -135,7 +140,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_SafeLiteralFieldInBody_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"currency":"TRY","quantity":2}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -154,7 +159,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_GenericNameField_UnderNonPersonArrayContext_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(
             responseBodyJson: """{"catalogTypes":[{"id":1,"name":"Mug"},{"id":2,"name":"T-Shirt"}]}""");
 
@@ -170,7 +175,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_GenericNameField_UnderCustomerContext_ProducesSyntheticValue()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"customer":{"name":"Ayşe Yılmaz"}}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -184,7 +189,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_GenericNameField_AtDocumentRoot_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"name":"Widget"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -209,7 +214,7 @@ public sealed class AnonymizerTests
     [InlineData("employees")]
     public void Anonymize_GenericNameField_UnderPluralPersonCollection_ProducesSyntheticValue(string collectionFieldName)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(
             requestBodyJson: $$"""{"{{collectionFieldName}}":[{"name":"Ahmet Yılmaz"}]}""");
 
@@ -226,7 +231,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_GenericNameField_UnderPluralNonPersonCollection_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"companies":[{"name":"Acme Corp"}]}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -239,7 +244,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_GenericNameField_UnderCatalogTypesArray_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"catalogTypes":[{"name":"Mug"}]}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -256,7 +261,7 @@ public sealed class AnonymizerTests
     public void Anonymize_SameIdValue_BodyStringAndRouteParameter_ProduceSameDigest()
     {
         const string customerId = "c9f14b2e-8a31-4f6d-9e02-77aa41b0c5d3";
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
 
         var bodyInteraction = anonymizer.Anonymize(BuildInteraction(requestBodyJson: $$"""{"customerId":"{{customerId}}"}"""));
         var routeInteraction = anonymizer.Anonymize(BuildInteraction(routeParameters: [new RouteParameter("id", customerId, "Guid")]));
@@ -276,7 +281,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_RawPath_ReplacesRouteParameterValue_ConsistentlyWithRouteParameters()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(routeParameters: [new RouteParameter("id", "42", "int")], rawPath: "/api/orders/42");
 
         var result = anonymizer.Anonymize(interaction);
@@ -289,7 +294,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_QueryParameters_TransformedAndQueryStringRebuiltFromThem()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["categoryId"] = "55" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -303,7 +308,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_TruncatedJsonBody_WithholdsText_RatherThanLeakingPlaintext()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"email":"real@customer.com","incompl""", requestBodyTruncated: true);
 
         var result = anonymizer.Anonymize(interaction);
@@ -314,7 +319,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_InvalidJsonBody_WithholdsText_RatherThanLeakingPlaintext()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: "not valid json {{{");
 
         var result = anonymizer.Anonymize(interaction);
@@ -325,7 +330,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_LocationHeader_LastSegmentIdentifierShaped_IsFingerprinted()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(locationHeader: "/api/customers/c9f14b2e-8a31-4f6d-9e02-77aa41b0c5d3");
 
         var result = anonymizer.Anonymize(interaction);
@@ -337,7 +342,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_AnonymizedHeaderAllowlist_TransformsOnlyListedHeader()
     {
-        var anonymizer = new Anonymizer(Key, Options, ["X-Idempotency-Key"]);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, ["X-Idempotency-Key"]);
         var interaction = BuildInteraction(requestHeaders: new Dictionary<string, string>
         {
             ["X-Idempotency-Key"] = "order-4821",
@@ -362,7 +367,7 @@ public sealed class AnonymizerTests
         // "BatchCount" is deliberately NOT one of the recognized pagination/counter names (GIZLILIK-2/G-1-1) —
         // this test is about the general unknown-field fail-safe's shape preservation, not the pagination
         // SafeLiteral exception (covered separately below).
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -375,7 +380,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_BooleanShapedQueryParameter_UnrecognizedFieldName_SyntheticValueStillParsesAsBoolean()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["IsArchived"] = "true" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -387,7 +392,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_QueryParameterSynthesis_IsDeterministic_SameInputSameOutput()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var first = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" }));
         var second = anonymizer.Anonymize(BuildInteraction(queryParameters: new Dictionary<string, string> { ["BatchCount"] = "10" }));
 
@@ -411,7 +416,7 @@ public sealed class AnonymizerTests
     [InlineData("offset", "1000000")]
     public void Anonymize_RecognizedPaginationCounterQueryParameter_NumericValue_PassesThroughUnchanged(string fieldName, string value)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { [fieldName] = value });
 
         var result = anonymizer.Anonymize(interaction);
@@ -424,7 +429,7 @@ public sealed class AnonymizerTests
     {
         // Name matches ("pageSize"), but the value does not look numeric at all — the shape gate must block the
         // SafeLiteral exception, so a name/value mismatch can never be used to sneak free text through unmasked.
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["pageSize"] = "ahmet@x.com" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -435,7 +440,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_IdentifierQueryParameter_StillFingerprinted_NoRegressionFromPaginationException()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["userId"] = "12345" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -449,7 +454,7 @@ public sealed class AnonymizerTests
         // The pagination/counter SafeLiteral exception is scoped to TransformTransportValue (route/query/header)
         // only — a JSON body leaf with the exact same field name must be unaffected (no regression on body
         // classification, and no accidental widening of the global SafeLiteralFieldNames allowlist).
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"pageSize":"10"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -462,7 +467,7 @@ public sealed class AnonymizerTests
     [InlineData("limit", "50")]
     public void Anonymize_PreExistingSafeLiteralCounterName_NoRegression(string fieldName, string value)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { [fieldName] = value });
 
         var result = anonymizer.Anonymize(interaction);
@@ -476,10 +481,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["pageSize"] = FieldClass.SecretTombstone },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var interaction = BuildInteraction(queryParameters: new Dictionary<string, string> { ["pageSize"] = "10" });
 
         var result = anonymizer.Anonymize(interaction);
@@ -493,10 +497,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["amount"] = FieldClass.SyntheticPii },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"amount":250}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -513,10 +516,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["amount"] = FieldClass.SyntheticPii },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"amount":250}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -535,10 +537,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["price"] = FieldClass.SyntheticPii },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"price":19.99}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -559,10 +560,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["pin"] = FieldClass.SecretTombstone },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"password":"Gizli123!","pin":4821}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -582,7 +582,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_FlowFingerprintNumericId_PassthroughStaysJsonNumber_NotJsonString()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"catalogTypes":[{"id":1,"name":"Mug"}]}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json; charset=utf-8");
@@ -597,7 +597,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_FlowFingerprintDecimalId_PassthroughStaysJsonNumber()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"customerId":42.5}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -616,7 +616,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_TokenField_PassesThroughLive_NotTombstoned_AndDeclaredInLiveJsonPaths()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"token":"live-session-token-abc123"}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -633,7 +633,7 @@ public sealed class AnonymizerTests
     {
         // Decision B, explicit exclusion: "password" is an INPUT secret, never a run-issued credential — it
         // must never pass through even though it sits right next to `token` in SecretFieldNames.
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"password":"Gizli123!","token":"live-token"}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -657,7 +657,7 @@ public sealed class AnonymizerTests
     [InlineData("nextCursor")]
     public void MaskReplayResponseBody_RunCredentialAllowlistFieldNames_PassThroughLive(string fieldName)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes($$"""{"{{fieldName}}":"live-opaque-value-xyz"}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -673,7 +673,7 @@ public sealed class AnonymizerTests
     {
         // "tokenizer" is one lowercase word ("tokenizer") from SplitWords' perspective, not the trailing word
         // "token" — proves the allowlist match is whole-word, never substring/prefix.
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"tokenizer":"Some Free Text Value"}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -688,10 +688,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["token"] = FieldClass.SecretTombstone },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"token":"live-token-abc123"}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -706,7 +705,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_NumericCursorField_PassesThroughLive_StaysJsonNumber_NotJsonString()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes("""{"cursor":42}""");
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -722,7 +721,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_TokenFieldInsideArray_DeclaresSingleWildcardPath_NotOnePerIndex()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = System.Text.Encoding.UTF8.GetBytes(
             """{"items":[{"cursor":"c1"},{"cursor":"c2"},{"cursor":"c3"}]}""");
 
@@ -739,7 +738,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_TokenFieldWithSpecialCharacter_PercentEncodesJsonPathSegment()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         // A JSON property name literally containing '.' — the RunCredential name match still applies (SplitWords
         // treats '.' as a separator, same as camelCase splitting), but the JSONPath segment must be encoded so
         // the declared path stays unambiguous against the '.' property-access delimiter.
@@ -756,7 +755,7 @@ public sealed class AnonymizerTests
     {
         // INVARIANT: RunCredential is a replay-only mechanism. The exact same field name, run through the
         // ordinary capture-side Anonymize(), must tombstone exactly as it always has.
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(requestBodyJson: """{"token":"real-login-token"}""");
 
         var result = anonymizer.Anonymize(interaction);
@@ -772,7 +771,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_AlreadySyntheticEmailFormat_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         // Exact deterministic shape GenerateEmail produces (user-<8 lowercase hex>@example.com) — does not need
         // to correspond to any real HMAC seed; idempotency recognition is format-based, not value-based.
         var body = """{"email":"user-deadbeef@example.com"}"""u8.ToArray();
@@ -789,7 +788,7 @@ public sealed class AnonymizerTests
     {
         // Regression guard for the false-passthrough risk: an ordinary real email must NOT match the narrow
         // synthetic-email shape and must still be synthesized as before.
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = """{"email":"jane.doe@realcustomer.example"}"""u8.ToArray();
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -805,9 +804,8 @@ public sealed class AnonymizerTests
     {
         // Simulates a request's `fp:` envelope (built from a masked corpus) being echoed back by the target
         // under a DIFFERENT response field name — value-shape recognition must catch this regardless of name.
-        var anonymizer = new Anonymizer(Key, Options, []);
-        var digest = FingerprintGenerator.ComputeCorrelationDigest(
-            Key, Options.Scope.TenantId, Options.Scope.ProjectId, Options.Scope.Environment, "id", "original-raw-value");
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
+        var digest = FingerprintGenerator.ComputeCorrelationDigest(Key, ScopeRef, "id", "original-raw-value");
         var envelope = ValueEnvelopeWriter.WriteFingerprint("s", "id", Options.KeyVersion, digest);
         var body = System.Text.Encoding.UTF8.GetBytes($$"""{"unrelatedFieldName":"{{envelope}}"}""");
 
@@ -822,7 +820,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void MaskReplayResponseBody_AlreadyTombstoneEnvelope_PassesThroughUnchanged_EvenUnderDifferentFieldName()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var body = """{"unrelatedFieldName":"jkp:tomb:s:originalfield"}"""u8.ToArray();
 
         var masked = anonymizer.MaskReplayResponseBody(body, "application/json");
@@ -837,7 +835,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void ClassifyReplayResponseHeader_SetCookie_DefaultsToLivePassthrough()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
 
         var decision = anonymizer.ClassifyReplayResponseHeader("Set-Cookie", "sessionId=abc123; Path=/; HttpOnly");
 
@@ -851,10 +849,9 @@ public sealed class AnonymizerTests
         var options = new AnonymizationOptions
         {
             KeyVersion = Options.KeyVersion,
-            Scope = Options.Scope,
             FieldPolicy = new Dictionary<string, FieldClass>(StringComparer.OrdinalIgnoreCase) { ["Set-Cookie"] = FieldClass.SecretTombstone },
         };
-        var anonymizer = new Anonymizer(Key, options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, options, []);
 
         var decision = anonymizer.ClassifyReplayResponseHeader("Set-Cookie", "sessionId=abc123");
 
@@ -878,7 +875,7 @@ public sealed class AnonymizerTests
     public void Anonymize_SubjectId_SameRawValue_IdentityCorrelationAndAuthBinding_ProduceIdenticalDigest()
     {
         const string subjectId = "auth0|64f1e2c3-real-user-guid";
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
 
         var result = anonymizer.Anonymize(BuildInteractionWithSubjectCopies(subjectId));
 
@@ -895,7 +892,7 @@ public sealed class AnonymizerTests
     [InlineData("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")]
     public void Anonymize_RoleClaim_BothTypeSpellings_PassThroughUnchanged(string roleClaimType)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(identity: new IdentityInfo
         {
             IsAuthenticated = true,
@@ -914,7 +911,7 @@ public sealed class AnonymizerTests
     [InlineData("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")]
     public void Anonymize_MultiValuedRoleClaim_BothTypeSpellings_PassThroughUnchanged(string roleClaimType)
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(identity: new IdentityInfo
         {
             IsAuthenticated = true,
@@ -936,7 +933,7 @@ public sealed class AnonymizerTests
     public void Anonymize_MultiValuedClaims_NonRoleValues_AreFingerprinted_NeverLeakPlaintext()
     {
         const string secretDepartmentValue = "top-secret-skunkworks-division-x9f3";
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(identity: new IdentityInfo
         {
             IsAuthenticated = true,
@@ -964,7 +961,7 @@ public sealed class AnonymizerTests
     public void Anonymize_SameClaimValue_ViaClaimsOrMultiValuedClaims_ProducesIdenticalEnvelope()
     {
         const string value = "engineering";
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
 
         var viaClaims = anonymizer.Anonymize(BuildInteraction(identity: new IdentityInfo
         {
@@ -985,7 +982,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_MultiValuedClaims_Null_PassesThroughUnchanged()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(identity: new IdentityInfo { IsAuthenticated = true });
 
         var result = anonymizer.Anonymize(interaction);
@@ -996,7 +993,7 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_UnrecognizedClaimType_IsFingerprinted_FailClosed()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(identity: new IdentityInfo
         {
             IsAuthenticated = true,
@@ -1014,7 +1011,7 @@ public sealed class AnonymizerTests
     public void Anonymize_LowCardinalityIdentityAndCorrelationFields_PassThroughUnchanged()
     {
         var observedAt = DateTimeOffset.UtcNow;
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         var interaction = BuildInteraction(
             identity: new IdentityInfo { IsAuthenticated = true, AuthenticationScheme = "Bearer" },
             correlation: new CorrelationSignals
@@ -1050,7 +1047,7 @@ public sealed class AnonymizerTests
     public void Anonymize_NoKeyConfigured_IdentityCorrelationAndAuthBinding_PassThroughUnchanged()
     {
         const string subjectId = "real-subject-id";
-        var anonymizer = new Anonymizer(key: null, Options, []);
+        var anonymizer = new Anonymizer(key: null, ScopeRef, Options, []);
         var interaction = BuildInteractionWithSubjectCopies(subjectId);
 
         var result = anonymizer.Anonymize(interaction);
@@ -1065,7 +1062,7 @@ public sealed class AnonymizerTests
     public void Anonymize_SubjectIdAndClaims_AreDeterministic_SameInputSameOutput()
     {
         const string subjectId = "deterministic-subject";
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
         Func<CapturedInteraction> build = () => BuildInteraction(identity: new IdentityInfo
         {
             IsAuthenticated = true,
@@ -1086,11 +1083,74 @@ public sealed class AnonymizerTests
     [Fact]
     public void Anonymize_SetsAnonScheme_HmacSha256V2()
     {
-        var anonymizer = new Anonymizer(Key, Options, []);
+        var anonymizer = new Anonymizer(Key, ScopeRef, Options, []);
 
         var result = anonymizer.Anonymize(BuildInteraction());
 
         Assert.Equal("hmac-sha256-v2", result.Anon!.Scheme);
+    }
+
+    /// <summary>The scope reference reported on the wire must be the one digests were actually derived under —
+    /// the server compares it against the environment the ingest key belongs to.</summary>
+    [Fact]
+    public void Anonymize_AnonScopeRef_IsTheScopeTheDigestsWereDerivedUnder()
+    {
+        const string otherScopeRef = "FEDCBA9876543210";
+        var anonymizer = new Anonymizer(Key, otherScopeRef, Options, []);
+
+        var result = anonymizer.Anonymize(BuildInteraction(requestBodyJson: """{"orderId":"7733"}"""));
+
+        Assert.Equal(otherScopeRef, result.Anon!.ScopeRef);
+        var envelope = ExtractFirstFingerprintEnvelope(result.Request.Body!.Text!);
+        var expectedDigest = FingerprintGenerator.ComputeCorrelationDigest(Key, otherScopeRef, "id", "7733");
+        Assert.Contains(expectedDigest, envelope);
+    }
+
+    /// <summary>Two deployments whose ingest keys carry different scope references must never produce the same
+    /// digest for the same raw value — that is the whole point of deriving the scope from the key.</summary>
+    [Fact]
+    public void Anonymize_DifferentScopeRefs_ProduceDifferentEnvelopesForTheSameValue()
+    {
+        var first = new Anonymizer(Key, "0123456789ABCDEF", Options, [])
+            .Anonymize(BuildInteraction(requestBodyJson: """{"orderId":"7733"}"""));
+        var second = new Anonymizer(Key, "FEDCBA9876543210", Options, [])
+            .Anonymize(BuildInteraction(requestBodyJson: """{"orderId":"7733"}"""));
+
+        Assert.NotEqual(first.Request.Body!.Text, second.Request.Body!.Text);
+    }
+
+    /// <summary>No scope reference means no ingest key we could parse, so there is no domain to separate
+    /// digests by — the anonymizer must report itself keyless and pass the interaction through rather than
+    /// inventing an empty scope shared by every such deployment.</summary>
+    [Fact]
+    public void Anonymize_NoScopeRef_ReportsNoKey_AndPassesThrough()
+    {
+        var anonymizer = new Anonymizer(Key, scopeRef: null, Options, []);
+        var interaction = BuildInteraction(requestBodyJson: """{"email":"real@customer.com"}""");
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.False(anonymizer.HasKey);
+        Assert.Same(interaction, result);
+        Assert.Null(result.Anon);
+    }
+
+    /// <summary>The DI constructor derives the scope from the ingest key; a key that does not parse must be
+    /// surfaced as a warning and must not silently fall back to an empty scope.</summary>
+    [Fact]
+    public void DIConstructor_MalformedIngestKey_LogsWarning_AndPassesThrough()
+    {
+        var logger = new RecordingLogger<Anonymizer>();
+        var options = new JakapilCaptureOptions { IngestKey = "ik_legacy_key" };
+
+        var anonymizer = new Anonymizer(Microsoft.Extensions.Options.Options.Create(options), logger);
+        var interaction = BuildInteraction(requestBodyJson: """{"email":"real@customer.com"}""");
+
+        var result = anonymizer.Anonymize(interaction);
+
+        Assert.False(anonymizer.HasKey);
+        Assert.Same(interaction, result);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
     }
 
     private static string ExtractFirstFingerprintEnvelope(string json)

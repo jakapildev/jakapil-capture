@@ -29,6 +29,10 @@ public class ReplayMiddlewareTests
     private const string EnvironmentId = "22222222-2222-2222-2222-222222222222";
     private static readonly byte[] AnonKey = "test-anonymization-key-0123456789"u8.ToArray();
 
+    /// <summary>The 16 uppercase-hex scope reference an ingest key carries in its prefix — the domain
+    /// separation every anonymization digest is derived under.</summary>
+    private const string AnonScopeRef = "0123456789ABCDEF";
+
     private sealed class RecordingQueue : ICapturedInteractionQueue
     {
         public readonly List<CapturedInteraction> Captured = [];
@@ -71,7 +75,7 @@ public class ReplayMiddlewareTests
                         services.AddSingleton<IAnonymizer>(sp =>
                         {
                             var opts = sp.GetRequiredService<IOptions<JakapilCaptureOptions>>().Value;
-                            return new Anonymizer(withAnonymizationKey ? AnonKey : null, opts.Anonymization, []);
+                            return new Anonymizer(withAnonymizationKey ? AnonKey : null, AnonScopeRef, opts.Anonymization, []);
                         });
                         services.AddSingleton<IReplayKeyRing, ReplayKeyRing>();
                         services.AddSingleton(sp => new ReplayNonceCache(sp.GetRequiredService<IOptions<JakapilCaptureOptions>>().Value.Replay.NonceCacheSize));

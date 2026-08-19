@@ -101,7 +101,7 @@ public sealed class EnvelopeGrammarTests
     public void WriteFingerprint_ProducesGrammarValidEnvelope(string jsonType, string semanticKind, int keyVersion)
     {
         var digest = FingerprintGenerator.ComputeCorrelationDigest(
-            "test-key"u8, "tenant", "project", "env", semanticKind, "some-value");
+            "test-key"u8, "0123456789ABCDEF", semanticKind, "some-value");
         var envelope = ValueEnvelopeWriter.WriteFingerprint(jsonType, semanticKind, keyVersion, digest);
 
         Assert.True(IsValidFingerprintEnvelope(envelope), $"Envelope '{envelope}' failed grammar validation.");
@@ -120,7 +120,7 @@ public sealed class EnvelopeGrammarTests
     [Fact]
     public void WriteFingerprint_NeverContainsExtraColon_InDigest()
     {
-        var digest = FingerprintGenerator.ComputeCorrelationDigest("k"u8, "t", "p", "e", "id", "value-with-!@#-chars");
+        var digest = FingerprintGenerator.ComputeCorrelationDigest("k"u8, "0123456789ABCDEF", "id", "value-with-!@#-chars");
 
         Assert.DoesNotContain(':', digest);
     }
